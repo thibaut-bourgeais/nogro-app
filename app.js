@@ -17,6 +17,7 @@ const defaultState = () => ({
   coachMemory: [], // long-term notes, rewritten by the coach on each plan import, editable by hand
   history: [], // finished sessions, oldest first
   measurements: [], // { id, date: "YYYY-MM-DD", weightKg, fatPct, muscleKg, bmrKcal, note }, oldest first
+  exerciseLinks: {}, // lowercase exercise name -> free-exercise-db id
   deleted: [], // ids of deleted sessions, so a sync merge does not bring them back
   plan: null, // next session prescribed by the coach
   active: null, // session in progress (local only, not synced)
@@ -53,6 +54,7 @@ function core(s) {
     coachMemory: s.coachMemory,
     history: s.history,
     measurements: s.measurements,
+    exerciseLinks: s.exerciseLinks,
     deleted: s.deleted,
     plan: s.plan,
   };
@@ -343,7 +345,11 @@ function mergeRemote(remote) {
   state.history = union(remote.history, state.history, "startedAt");
   state.measurements = union(remote.measurements, state.measurements, "date");
   state.deleted = deleted;
-  if (remote.updatedAt > state.updatedAt) {
+  const remoteNewer = remote.updatedAt > state.updatedAt;
+  state.exerciseLinks = remoteNewer
+    ? { ...state.exerciseLinks, ...remote.exerciseLinks }
+    : { ...remote.exerciseLinks, ...state.exerciseLinks };
+  if (remoteNewer) {
     state.profile = remote.profile;
     state.coachMemory = remote.coachMemory;
     state.plan = remote.plan;
@@ -765,6 +771,150 @@ function viewBody() {
       .join("")}`;
 }
 
+// ---------- exercise database (free-exercise-db, public domain) ----------
+// Pinned to a commit so cached files never go stale; the service worker caches them for offline use.
+
+const EXDB_BASE = "https://cdn.jsdelivr.net/gh/yuhonas/free-exercise-db@f00c92c7dcf1216a928a52c3706c7ce8e2f71ed5/";
+let exdb = null;
+let exdbError = "";
+
+function loadExdb() {
+  if (exdb || exdbError) return;
+  fetch(`${EXDB_BASE}dist/exercises.json`)
+    .then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .then((data) => (exdb = data))
+    .catch((err) => (exdbError = `Base d'exercices indisponible (${err.message}). Réessaie avec du réseau.`))
+    .finally(() => view === "exercise" && render());
+}
+
+const deaccent = (s) => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+
+// French gym vocabulary -> English words used by the database. Longest phrases first.
+const FR_EN = [
+  ["souleve de terre", "deadlift"], ["developpe couche", "bench press"], ["developpe incline", "incline press"],
+  ["developpe militaire", "shoulder press"], ["tirage vertical", "lat pulldown"], ["tirage horizontal", "seated cable row"],
+  ["elevations laterales", "lateral raise"], ["elevation laterale", "lateral raise"], ["presse a cuisses", "leg press"],
+  ["releve de jambes", "leg raise"], ["squat bulgare", "split squat"], ["gainage planche", "plank"],
+  ["developpe", "press"], ["couche", "bench"], ["halteres", "dumbbell"], ["haltere", "dumbbell"], ["barre", "barbell"],
+  ["tirage", "pulldown"], ["rowing", "row"], ["unilateral", "one arm"], ["militaire", "shoulder"], ["assis", "seated"],
+  ["debout", "standing"], ["pompes", "pushups"], ["planche", "plank"], ["gainage", "plank"], ["tractions", "pullups"],
+  ["fentes", "lunge"], ["mollets", "calf raise"], ["poulie", "cable"], ["ecarte", "fly"], ["roumain", "romanian"],
+  ["velo", "bicycling"], ["rameur", "rowing stationary"], ["oiseau", "reverse fly"], ["epaules", "shoulder"],
+];
+const STOP = new Set(["de", "du", "des", "a", "au", "la", "le", "les", "avec", "en", "et", "test", "zone", "2"]);
+
+function tokens(s) {
+  let t = deaccent(s);
+  for (const [fr, en] of FR_EN) t = t.replaceAll(fr, en);
+  return t.split(/[^a-z0-9]+/).filter((w) => w && !STOP.has(w));
+}
+
+// Token overlap; prefix match counts so "pushup" finds "pushups".
+function matchScore(q, name) {
+  const n = tokens(name);
+  let hits = 0;
+  for (const w of q) if (n.some((x) => x === w || (w.length >= 4 && (x.startsWith(w) || w.startsWith(x))))) hits++;
+  return hits ? hits * 2 - (n.length - hits) * 0.3 : 0;
+}
+
+function exdbResults(query) {
+  if (!exdb) return "";
+  const q = tokens(query);
+  const hits = exdb
+    .map((x) => ({ x, s: matchScore(q, x.name) }))
+    .filter((r) => r.s > 0)
+    .sort((a, b) => b.s - a.s)
+    .slice(0, 12);
+  if (!hits.length) return `<p class="muted">Aucun résultat. Essaie en anglais (ex. "bench press").</p>`;
+  return hits
+    .map(
+      ({ x }) => `
+      <button class="list-item exdb-hit" data-action="link-ex" data-id="${esc(x.id)}">
+        <img src="${EXDB_BASE}exercises/${esc(x.images[0])}" alt="" loading="lazy" crossorigin="anonymous">
+        <span><strong>${esc(x.name)}</strong><br><span class="muted">${esc(x.equipment || "—")} · ${esc(x.primaryMuscles.join(", "))}</span></span>
+      </button>`
+    )
+    .join("");
+}
+
+const MUSCLES_FR = {
+  abdominals: "abdos", chest: "pectoraux", shoulders: "épaules", triceps: "triceps", biceps: "biceps",
+  lats: "grand dorsal", "middle back": "milieu du dos", "lower back": "lombaires", quadriceps: "quadriceps",
+  hamstrings: "ischios", glutes: "fessiers", calves: "mollets", forearms: "avant-bras", traps: "trapèzes",
+  adductors: "adducteurs", abductors: "abducteurs", neck: "cou",
+};
+const muscles = (list) => list.map((m) => MUSCLES_FR[m] || m).join(", ");
+
+function viewExercise(arg) {
+  const header = `
+    <button class="small" data-action="ex-back">← Retour</button>
+    <div class="eyebrow" style="margin-top:14px">Fiche exercice</div>
+    <h1 class="lead">${esc(arg.name)}</h1>`;
+  if (exdbError) return `${header}<p class="note">${esc(exdbError)}</p>`;
+  if (!exdb) {
+    loadExdb();
+    return `${header}<p class="muted">Chargement de la base d'exercices…</p>`;
+  }
+  const ex = exdb.find((x) => x.id === state.exerciseLinks[arg.name.trim().toLowerCase()]);
+  if (!ex || arg.search) {
+    return `${header}
+      <p class="muted">${ex ? "Choisis une autre fiche." : "Pas encore de fiche liée. Choisis la bonne, l'app s'en souviendra."}</p>
+      <input id="exdb-q" value="${esc(arg.name)}" placeholder="Rechercher (FR ou EN)" autocomplete="off">
+      <div id="exdb-results" style="margin-top:12px">${exdbResults(arg.name)}</div>`;
+  }
+  const img = (i) => `${EXDB_BASE}exercises/${esc(ex.images[i])}`;
+  return `${header}
+    <div class="exdb-anim">
+      <img src="${img(0)}" alt="Position de départ" crossorigin="anonymous">
+      ${ex.images[1] ? `<img class="end" src="${img(1)}" alt="Position d'arrivée" crossorigin="anonymous">` : ""}
+    </div>
+    <div class="card">
+      <p><strong>${esc(ex.name)}</strong></p>
+      <p class="muted">${esc(ex.equipment || "—")} · niveau ${esc(ex.level)} · ${esc(ex.mechanic || ex.category)}</p>
+      <p>Muscles : <strong>${esc(muscles(ex.primaryMuscles))}</strong>${ex.secondaryMuscles.length ? ` · ${esc(muscles(ex.secondaryMuscles))}` : ""}</p>
+    </div>
+    <div class="card">
+      <h2>Exécution</h2>
+      <ol class="steps">${ex.instructions.map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
+    </div>
+    <button class="block" data-action="ex-search">Ce n'est pas le bon exercice</button>`;
+}
+
+const RPE_SCALE = [
+  ["10", "0", "Échec : impossible d'en faire une de plus"],
+  ["9", "1", "Très dur, une seule de plus au maximum"],
+  ["8", "2", "Dur, mais il en restait deux"],
+  ["7", "3", "La charge bouge encore vite"],
+  ["6", "4", "Effort modéré"],
+  ["≤ 5", "5 +", "Échauffement"],
+];
+
+function showRpeHelp() {
+  let d = $("#rpe-dialog");
+  if (!d) {
+    d = document.createElement("dialog");
+    d.id = "rpe-dialog";
+    d.innerHTML = `
+      <h2>RPE : difficulté ressentie</h2>
+      <p class="muted">Combien de reps propres tu aurais encore pu faire à la fin de la série ?</p>
+      <table class="rpe">
+        <tr><th>RPE</th><th>Reps en réserve</th><th></th></tr>
+        ${RPE_SCALE.map(([r, rir, txt]) => `<tr><td><strong>${r}</strong></td><td>${rir}</td><td>${txt}</td></tr>`).join("")}
+      </table>
+      <p class="muted">Demi-points possibles : 8,5 = « peut-être 2, sûrement 1 ». Note-le juste après la série.
+        Les RPE du plan sont des cibles : remplace-les par ton ressenti réel.
+        RPE séance = à quel point la séance entière t'a vidé (1 à 10).</p>
+      <button class="primary block" data-action="rpe-close">OK</button>`;
+    // Tap on the backdrop closes it.
+    d.addEventListener("click", (ev) => ev.target === d && d.close());
+    document.body.append(d);
+  }
+  d.showModal();
+}
+
 const NAV = [
   ["home", "Accueil", '<path d="M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>'],
   ["history", "Historique", '<path d="M4 5h16M4 12h16M4 19h10"/>'],
@@ -791,12 +941,15 @@ function viewWorkout() {
       <div class="card">
         <div class="spread">
           <h2>${esc(e.name)}</h2>
-          <button class="small danger" data-action="del-ex" data-ex="${i}">✕</button>
+          <span class="row" style="flex:0">
+            <button class="small" data-action="ex-info" data-name="${esc(e.name)}" aria-label="Fiche exercice">ⓘ</button>
+            <button class="small danger" data-action="del-ex" data-ex="${i}">✕</button>
+          </span>
         </div>
         ${e.note ? `<p class="note">${esc(e.note)}</p>` : ""}
         ${prev ? `<p class="muted">Dernière fois (${fmtDate(prev.date)}) : ${prev.sets.map(fmtSet).join(", ")}</p>` : ""}
         <div class="sets">
-          <div class="set head"><span>#</span><span>kg</span><span>reps</span><span>RPE</span><span></span></div>
+          <div class="set head"><span>#</span><span>kg</span><span>reps</span><button class="link-head" data-action="rpe-help">RPE ⓘ</button><span></span></div>
           ${e.sets
             .map(
               (s, j) => `
@@ -850,7 +1003,7 @@ function viewFinish() {
     <form data-form="finish" class="card">
       <div class="row">
         <div><label>Énergie (1–5)</label><select name="energy">${opts(5)}</select></div>
-        <div><label>RPE séance (1–10)</label><select name="sessionRpe">${opts(10)}</select></div>
+        <div><label>RPE séance (1–10) <button type="button" class="link-head" data-action="rpe-help">ⓘ</button></label><select name="sessionRpe">${opts(10)}</select></div>
       </div>
       <label>Douleur / gêne (où, quand, intensité)</label>
       <textarea name="pain" placeholder="Rien à signaler"></textarea>
@@ -990,6 +1143,7 @@ function render() {
     session: () => viewSession(viewArg),
     settings: viewSettings,
     body: viewBody,
+    exercise: () => viewExercise(viewArg),
   };
   $("#app").innerHTML = (views[view] || viewHome)() + navBar();
 }
@@ -1063,6 +1217,25 @@ document.addEventListener("click", async (ev) => {
         $("#import-error").textContent = "Accès au presse-papier refusé : colle à la main (appui long).";
       }
       return;
+    case "rpe-help":
+      return showRpeHelp();
+    case "rpe-close":
+      return $("#rpe-dialog").close();
+    case "ex-info":
+      return go("exercise", { name: t.dataset.name, back: view, search: false, scroll: window.scrollY });
+    case "ex-search":
+      viewArg = { ...viewArg, search: true };
+      return render();
+    case "link-ex":
+      state.exerciseLinks[viewArg.name.trim().toLowerCase()] = t.dataset.id;
+      save();
+      viewArg = { ...viewArg, search: false };
+      return render();
+    case "ex-back": {
+      const y = viewArg.scroll || 0;
+      go(viewArg.back || "home");
+      return window.scrollTo(0, y);
+    }
     case "del-measure":
       if (!confirm("Supprimer cette mesure ?")) return;
       state.measurements = state.measurements.filter((m) => m.id !== t.dataset.id);
@@ -1082,6 +1255,10 @@ document.addEventListener("click", async (ev) => {
 
 document.addEventListener("input", (ev) => {
   const t = ev.target;
+  if (t.id === "exdb-q") {
+    $("#exdb-results").innerHTML = exdbResults(t.value);
+    return;
+  }
   const field = t.dataset.field;
   if (!field || !state.active) return;
   if (field === "name") state.active.name = t.value;

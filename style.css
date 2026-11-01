@@ -199,3 +199,31 @@ nav.tabs button.on { color: var(--accent); }
 #rest .time { font-size: 28px; font-variant-numeric: tabular-nums; flex: 1; font-weight: 800; }
 #rest button { background: rgba(59, 19, 6, 0.12); border-color: rgba(59, 19, 6, 0.2); color: var(--accent-ink); }
 #rest.over { background: #fca5a5; }
+
+/* Exercise sheet: start/end photos cross-fade to suggest the movement */
+.exdb-anim { position: relative; aspect-ratio: 4 / 3; border-radius: 18px; overflow: hidden; background: var(--card-solid); margin-bottom: 14px; }
+.exdb-anim img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.exdb-anim img.end { animation: exdb-flip 2.4s infinite; }
+@keyframes exdb-flip { 0%, 40% { opacity: 0; } 50%, 90% { opacity: 1; } 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .exdb-anim img.end { animation: none; opacity: 0; } }
+.exdb-hit { display: flex; gap: 12px; align-items: center; }
+.exdb-hit img { width: 64px; height: 48px; object-fit: cover; border-radius: 8px; background: var(--card-solid); flex: none; }
+.steps { padding-left: 20px; margin: 0; }
+.steps li { margin-bottom: 8px; }
+
+/* RPE help */
+.link-head { background: none; border: none; min-height: 0; padding: 0; color: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+dialog {
+  background: var(--card-solid);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 18px;
+  width: min(420px, calc(100vw - 32px));
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+table.rpe { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 14px; }
+table.rpe th { text-align: left; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 4px 6px; }
+table.rpe td { padding: 7px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+table.rpe td:first-child { color: var(--accent); width: 42px; }
+table.rpe td:nth-child(2) { width: 64px; text-align: center; }

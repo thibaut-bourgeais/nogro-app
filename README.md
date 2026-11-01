@@ -31,6 +31,10 @@ The app syncs `nogro-data.json` after each change, on start, and when back onlin
 Sessions merge as a union by id (deletions kept as tombstones); profile and plan come from the newer side.
 The session in progress stays local. The token is stored on the phone, outside the backup export.
 
+## Exercise database
+
+Exercise sheets (photos, muscles, instructions) come from [free-exercise-db](https://github.com/yuhonas/free-exercise-db) (public domain), pinned to a commit and loaded from jsDelivr on demand. The service worker caches viewed sheets for offline use. The link between an exercise name and a database entry is chosen once by the user and synced.
+
 ## Updating
 
 Bump `CACHE` in `sw.js` on every deploy, otherwise phones keep the old cached version.
