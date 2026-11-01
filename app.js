@@ -13,11 +13,14 @@ const SYNC_DEBOUNCE_MS = 2000;
 const SYNC_STALE_MS = 5 * 60 * 1000;
 
 const defaultState = () => ({
-  profile: { goals: "", level: "", constraints: "", schedule: "", equipment: "", heightCm: "", coach: "claude" },
+  profile: { goals: "", level: "", constraints: "", schedule: "", equipment: "", heightCm: "", coach: "claude", sound: "on" },
   coachMemory: [], // long-term notes, rewritten by the coach on each plan import, editable by hand
   history: [], // finished sessions, oldest first
   measurements: [], // { id, date: "YYYY-MM-DD", weightKg, fatPct, muscleKg, bmrKcal, note }, oldest first
   exerciseLinks: {}, // lowercase exercise name -> free-exercise-db id
+  food: { likes: "", dislikes: "", allergies: "", cooking: "", other: "" }, // meal-idea preferences
+  meals: [], // meal ideas from the LLM: { id, name, type, portions, kcal, protein, prepMin, batch, ingredients, steps, tips, fav }
+  shopping: [], // { text, done }
   deleted: [], // ids of deleted sessions, so a sync merge does not bring them back
   plan: null, // next session prescribed by the coach
   active: null, // session in progress (local only, not synced)
@@ -30,12 +33,14 @@ let sync = loadSync();
 let view = state.active ? "workout" : "home";
 let viewArg = null;
 let rest = null; // { endAt: epoch ms, totalS: number }
+let work = null; // running stopwatch: { ex, set, goAt: epoch ms, target: s }
 let wakeLock = null;
 
 // ---------- storage ----------
 
 function normalize(s) {
-  return { ...defaultState(), ...s, profile: { ...defaultState().profile, ...s.profile } };
+  const d = defaultState();
+  return { ...d, ...s, profile: { ...d.profile, ...s.profile }, food: { ...d.food, ...s.food } };
 }
 
 function load() {
@@ -55,6 +60,9 @@ function core(s) {
     history: s.history,
     measurements: s.measurements,
     exerciseLinks: s.exerciseLinks,
+    food: s.food,
+    meals: s.meals,
+    shopping: s.shopping,
     deleted: s.deleted,
     plan: s.plan,
   };
@@ -94,10 +102,15 @@ function isoDay(iso) {
   return iso.slice(0, 10);
 }
 
-function fmtSet(s) {
-  const kg = s.kg === "" || s.kg === undefined ? "PDC" : `${s.kg}kg`;
-  return `${kg}×${s.reps}${s.rpe !== "" && s.rpe !== undefined ? `@${s.rpe}` : ""}`;
+// Timed sets store the duration in seconds in "reps".
+function fmtSet(s, timed = false) {
+  const rpe = s.rpe !== "" && s.rpe !== undefined ? `@${s.rpe}` : "";
+  const hasKg = s.kg !== "" && s.kg !== undefined;
+  if (timed) return `${hasKg ? `${s.kg}kg ` : ""}${s.reps} s${rpe}`;
+  return `${hasKg ? `${s.kg}kg` : "PDC"}×${s.reps}${rpe}`;
 }
+
+const fmtSets = (ex) => (ex.sets || []).map((s) => fmtSet(s, ex.timed)).join(", ");
 
 // BMI = kg / m². Returns "" when height or weight is missing.
 function bmi(weightKg, heightCm = state.profile.heightCm) {
@@ -131,7 +144,7 @@ function knownExercises() {
 function lastPerf(name) {
   for (let i = state.history.length - 1; i >= 0; i--) {
     const ex = state.history[i].exercises.find((e) => sameName(e.name, name));
-    if (ex) return { date: state.history[i].startedAt, sets: ex.sets };
+    if (ex) return { date: state.history[i].startedAt, sets: ex.sets, timed: ex.timed };
   }
   return null;
 }
@@ -157,6 +170,7 @@ function startWorkout(fromPlan) {
           name: e.name,
           restS: e.rest_s || REST_DEFAULT_S,
           note: e.notes || "",
+          timed: Boolean(e.timed),
           sets: (e.sets || []).map((s) => ({ kg: s.kg ?? "", reps: s.reps ?? "", rpe: s.rpe ?? "", done: false })),
         }))
       : [],
@@ -185,6 +199,7 @@ function finishWorkout(form) {
   const exercises = a.exercises
     .map((e) => ({
       name: e.name,
+      ...(e.timed ? { timed: true } : {}),
       sets: e.sets.filter((s) => s.done && s.reps !== "").map(({ kg, reps, rpe }) => ({ kg, reps, rpe })),
     }))
     .filter((e) => e.sets.length);
@@ -206,6 +221,7 @@ function finishWorkout(form) {
   if (a.plan) state.plan = null;
   state.active = null;
   save();
+  work = null;
   stopRest();
   releaseWakeLock();
   go("report", session.id);
@@ -213,36 +229,147 @@ function finishWorkout(form) {
 
 // ---------- rest timer ----------
 
+// ---------- sound ----------
+// Beeps are scheduled on the audio clock, so they stay on time even when timers are throttled.
+// Output follows the phone's audio route (Bluetooth / wired headphones when connected).
+
+let audioCtx = null;
+let scheduledBeeps = [];
+
+const soundOn = () => state.profile.sound !== "off";
+
+function audio() {
+  audioCtx ||= new AudioContext();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+
+function beepAt(delayS, freqHz, durS) {
+  const c = audio();
+  const t = c.currentTime + Math.max(0, delayS);
+  const osc = c.createOscillator();
+  const gain = c.createGain();
+  osc.frequency.value = freqHz;
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(0.5, t + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + durS);
+  osc.connect(gain).connect(c.destination);
+  osc.start(t);
+  osc.stop(t + durS + 0.05);
+  scheduledBeeps.push(osc);
+}
+
+function cancelBeeps() {
+  for (const o of scheduledBeeps) {
+    try {
+      o.stop();
+    } catch {
+      /* already stopped */
+    }
+  }
+  scheduledBeeps = [];
+}
+
+// Short ticks at 3, 2, 1 s before the end, then a long high tone at the end.
+function scheduleCountdown(endInS) {
+  if (!soundOn()) return;
+  for (const k of [3, 2, 1]) if (endInS - k > 0) beepAt(endInS - k, 660, 0.12);
+  beepAt(endInS, 990, 0.6);
+}
+
+// ---------- rest timer & exercise stopwatch ----------
+// One bar at a time: the stopwatch hides the rest timer while it runs.
+
+const WORK_READY_S = 5; // countdown before a timed set, to get into position
+
 function startRest(seconds) {
   rest = { endAt: Date.now() + seconds * 1000, totalS: seconds, buzzed: false };
-  tickRest();
+  cancelBeeps();
+  scheduleCountdown(seconds);
+  tickBar();
 }
 
 function stopRest() {
   rest = null;
-  $("#rest").hidden = true;
+  cancelBeeps();
+  tickBar();
 }
 
-function tickRest() {
+function startWork(exIdx) {
+  const e = state.active.exercises[exIdx];
+  let setIdx = e.sets.findIndex((s) => !s.done);
+  if (setIdx < 0) {
+    const last = e.sets.at(-1);
+    e.sets.push({ kg: last?.kg ?? "", reps: last?.reps ?? "", rpe: "", done: false });
+    setIdx = e.sets.length - 1;
+  }
+  // A non-timed exercise has reps, not seconds: no target, and it becomes timed only once a set is saved.
+  const target = e.timed ? num(e.sets[setIdx].reps) || 0 : 0;
+  rest = null;
+  work = { ex: exIdx, set: setIdx, goAt: Date.now() + WORK_READY_S * 1000, target, buzzed: false };
+  cancelBeeps();
+  scheduleCountdown(WORK_READY_S);
+  if (target) scheduleCountdown(WORK_READY_S + target);
+  tickBar();
+}
+
+function stopWork(save_ = true) {
+  const w = work;
+  work = null;
+  cancelBeeps();
+  if (!w) return tickBar();
+  const elapsed = Math.round((Date.now() - w.goAt) / 1000);
+  const e = state.active?.exercises[w.ex];
+  if (save_ && e && elapsed > 0) {
+    e.timed = true;
+    Object.assign(e.sets[w.set], { reps: elapsed, done: true });
+    save();
+    render();
+    return startRest(Number(e.restS) || REST_DEFAULT_S);
+  }
+  tickBar();
+}
+
+const fmtClock = (s) => `${s < 0 ? "+" : ""}${Math.floor(Math.abs(s) / 60)}:${String(Math.abs(s) % 60).padStart(2, "0")}`;
+
+function tickBar() {
   const el = $("#rest");
-  if (!rest) return;
+  if (work) {
+    const sinceGo = Math.floor((Date.now() - work.goAt) / 1000);
+    const name = state.active?.exercises[work.ex]?.name ?? "";
+    const reached = work.target && sinceGo >= work.target;
+    if (reached && !work.buzzed) {
+      work.buzzed = true;
+      navigator.vibrate?.([300, 150, 300]);
+    }
+    el.hidden = false;
+    el.className = sinceGo < 0 ? "ready" : reached ? "reached" : "work";
+    el.innerHTML = `
+      <span class="time">${sinceGo < 0 ? `Prêt ${-sinceGo}` : fmtClock(sinceGo)}
+        <small>${esc(name)} · série ${work.set + 1}${work.target ? ` · cible ${work.target} s` : ""}</small></span>
+      <button class="small" data-action="work-cancel">✕</button>
+      <button class="small" data-action="work-stop">Stop</button>`;
+    return;
+  }
+  if (!rest) {
+    el.hidden = true;
+    return;
+  }
   const left = Math.round((rest.endAt - Date.now()) / 1000);
   if (left <= 0 && !rest.buzzed) {
     rest.buzzed = true;
     navigator.vibrate?.([300, 150, 300]);
   }
-  const abs = Math.abs(left);
-  const t = `${left < 0 ? "+" : ""}${Math.floor(abs / 60)}:${String(abs % 60).padStart(2, "0")}`;
   el.hidden = false;
-  el.classList.toggle("over", left < 0);
+  el.className = left < 0 ? "over" : "";
   el.innerHTML = `
-    <span class="time">${t}</span>
+    <span class="time">${fmtClock(left)}<small>Repos</small></span>
     <button class="small" data-action="rest-add" data-s="-15">−15</button>
     <button class="small" data-action="rest-add" data-s="15">+15</button>
     <button class="small" data-action="rest-stop">OK</button>`;
 }
 
-setInterval(tickRest, 500);
+setInterval(tickBar, 250);
 
 async function holdWakeLock() {
   try {
@@ -353,6 +480,9 @@ function mergeRemote(remote) {
     state.profile = remote.profile;
     state.coachMemory = remote.coachMemory;
     state.plan = remote.plan;
+    state.food = remote.food;
+    state.meals = remote.meals;
+    state.shopping = remote.shopping;
   }
   save();
   // Do not re-render under the user's fingers during a workout.
@@ -458,7 +588,8 @@ const COACH_GUIDE = `
 - Noms d'exercices : réutilise EXACTEMENT les noms de l'historique pour le même exercice. N'invente pas de nouveau
   nom pour un exercice déjà fait. Variante nouvelle = nom nouveau et explicite.
 - Conventions : kg = charge par haltère pour les haltères, charge totale sinon. "kg" absent = poids de corps.
-  Gainage et cardio : "reps" = secondes ou minutes, précise l'unité dans "notes". "rest_s" en secondes.
+  Exercices chronométrés (gainage, cardio, isométrie) : "timed": true et "reps" = durée en SECONDES (12 min = 720).
+  "rest_s" en secondes.
 `;
 
 const PLAN_FORMAT = `{
@@ -472,13 +603,14 @@ const PLAN_FORMAT = `{
       "rest_s": 150,
       "notes": "Consigne technique ou de progression",
       "sets": [ { "kg": 60, "reps": 8, "rpe": 8 } ]
-    }
+    },
+    { "name": "Gainage planche", "timed": true, "rest_s": 45, "sets": [ { "reps": 45 } ] }
   ]
 }`;
 
 function sessionBlock(h) {
   const lines = [`### ${isoDay(h.startedAt)} — ${h.name} (${h.durationMin} min)`];
-  for (const e of h.exercises) lines.push(`- ${e.name} : ${e.sets.map(fmtSet).join(", ")}`);
+  for (const e of h.exercises) lines.push(`- ${e.name} : ${fmtSets(e)}`);
   const f = h.feedback || {};
   const fb = [
     f.energy && `énergie ${f.energy}/5`,
@@ -541,10 +673,10 @@ function buildReport(session) {
   if (session.plan) {
     const rows = session.plan.exercises.map((pe) => {
       const done = session.exercises.find((e) => sameName(e.name, pe.name));
-      return `- ${pe.name} : prévu ${(pe.sets || []).map(fmtSet).join(", ")} → fait ${done ? done.sets.map(fmtSet).join(", ") : "rien"}`;
+      return `- ${pe.name} : prévu ${fmtSets(pe)} → fait ${done ? fmtSets(done) : "rien"}`;
     });
     const extra = session.exercises.filter((e) => !session.plan.exercises.some((pe) => sameName(pe.name, e.name)));
-    for (const e of extra) rows.push(`- ${e.name} (hors plan) : ${e.sets.map(fmtSet).join(", ")}`);
+    for (const e of extra) rows.push(`- ${e.name} (hors plan) : ${fmtSets(e)}`);
     planVsDone = `\n## Prévu vs réalisé\n${rows.join("\n")}\n`;
   }
 
@@ -603,6 +735,7 @@ function parsePlan(input) {
     if (!Array.isArray(e.sets)) throw new Error(`L'exercice '${e.name}' n'a pas de 'sets'.`);
     e.sets = e.sets.map((s) => ({ kg: num(s.kg), reps: num(s.reps), rpe: num(s.rpe) }));
     e.rest_s = num(e.rest_s) || REST_DEFAULT_S;
+    e.timed = Boolean(e.timed);
   }
   obj.name = obj.name || "Séance du coach";
   const memory = Array.isArray(obj.memory) ? obj.memory.map(String).map((m) => m.trim()).filter(Boolean) : null;
@@ -915,15 +1048,185 @@ function showRpeHelp() {
   d.showModal();
 }
 
+// ---------- meal ideas (no tracking: the LLM proposes simple meals that fit the goal) ----------
+
+const MEALS_FORMAT = `{
+  "meals": [
+    {
+      "name": "Poulet riz brocoli sauce soja-miel",
+      "type": "repas",
+      "portions": 4,
+      "kcal_per_portion": 600,
+      "protein_g": 50,
+      "prep_min": 25,
+      "batch": true,
+      "ingredients": ["800 g de blanc de poulet", "300 g de riz (cru)"],
+      "steps": ["Cuire le riz", "Saisir le poulet en dés"],
+      "tips": "Se garde 4 jours au frigo. Variante : remplacer le soja par du curry."
+    }
+  ],
+  "shopping": ["800 g de blanc de poulet", "1 kg de riz"]
+}`;
+
+function buildFoodPrompt(craving) {
+  const f = state.food;
+  const m = state.measurements.at(-1);
+  const favs = state.meals.filter((x) => x.fav).map((x) => `- ${x.name}`);
+  const prefs = [
+    f.likes && `- J'aime : ${f.likes}`,
+    f.dislikes && `- Je n'aime pas / je ne mange pas : ${f.dislikes}`,
+    f.allergies && `- Allergies / intolérances : ${f.allergies}`,
+    f.cooking && `- Cuisine (temps, matériel, batch cooking) : ${f.cooking}`,
+    f.other && `- Autre : ${f.other}`,
+  ].filter(Boolean);
+  return `Tu es mon coach nutrition. Je ne compte pas les calories et je ne veux pas de suivi : donne-moi des idées
+de repas simples, qui collent à mon objectif sportif et à mes goûts. Je suis difficile : respecte strictement
+mes "je n'aime pas". Le basique répétitif (poulet-riz, etc.) me va très bien : vise efficace et facile, pas gastronomique.
+
+Règles :
+- Riche en protéines (≥ 35 g par repas principal, ≥ 20 g par petit-déjeuner ou collation), adapté à une perte de gras sans perte de muscle.
+- Ingrédients de supermarché courant, peu d'étapes. Privilégie les plats qui se préparent en grande quantité et se gardent 3-4 jours.
+- 7 idées : 2 petits-déjeuners, 3 repas principaux (au moins 2 en batch de 4 portions), 2 collations.
+- Ne répète pas mes favoris, mais propose des idées dans le même esprit.
+- "shopping" = liste de courses regroupée pour préparer toutes les idées, quantités comprises.
+- Valeurs nutritionnelles = estimations par portion.
+
+Réponds avec UN SEUL bloc \`\`\`json à ce format (JSON strict, sans commentaires) :
+${MEALS_FORMAT}
+"type" vaut "petit-déj", "repas" ou "collation".
+
+## Objectif et profil
+${state.profile.goals ? `- ${state.profile.goals}` : "- (non renseigné)"}
+${m ? fmtMeasure(m) : ""}
+
+## Mémoire du coach (repères nutrition inclus)
+${state.coachMemory.length ? state.coachMemory.map((x) => `- ${x}`).join("\n") : "- (vide)"}
+
+## Mes goûts
+${prefs.length ? prefs.join("\n") : "- (non renseignés)"}
+
+## Mes favoris
+${favs.length ? favs.join("\n") : "- (aucun)"}
+${craving.trim() ? `\n## Envie du moment\n${craving.trim()}\n` : ""}`;
+}
+
+function importMeals(obj) {
+  if (!Array.isArray(obj.meals) || !obj.meals.length) throw new Error("Le champ 'meals' est absent ou vide.");
+  const fresh = obj.meals.map((x, i) => ({
+    id: `meal${Date.now().toString(36)}${i}`,
+    name: String(x.name || "Sans nom"),
+    type: String(x.type || "repas"),
+    portions: num(x.portions),
+    kcal: num(x.kcal_per_portion ?? x.kcal),
+    protein: num(x.protein_g ?? x.protein),
+    prepMin: num(x.prep_min),
+    batch: Boolean(x.batch),
+    ingredients: Array.isArray(x.ingredients) ? x.ingredients.map(String) : [],
+    steps: Array.isArray(x.steps) ? x.steps.map(String) : [],
+    tips: x.tips ? String(x.tips) : "",
+    fav: false,
+  }));
+  // Favourites survive a new batch of ideas; the rest is replaced.
+  state.meals = [...state.meals.filter((x) => x.fav), ...fresh];
+  if (Array.isArray(obj.shopping)) state.shopping = obj.shopping.map((text) => ({ text: String(text), done: false }));
+}
+
+const MEAL_TYPES = [
+  ["petit-déj", "Petits-déjeuners"],
+  ["repas", "Repas"],
+  ["collation", "Collations"],
+];
+
+function mealCard(m) {
+  const facts = [
+    m.protein !== "" && `${m.protein} g prot.`,
+    m.kcal !== "" && `~${m.kcal} kcal`,
+    m.prepMin !== "" && `${m.prepMin} min`,
+    m.batch && m.portions && `batch ${m.portions} portions`,
+  ].filter(Boolean);
+  return `
+    <details class="card meal">
+      <summary>
+        <div class="spread">
+          <strong>${esc(m.name)}</strong>
+          <button class="small star ${m.fav ? "on" : ""}" data-action="meal-fav" data-id="${m.id}" aria-label="Favori">${m.fav ? "★" : "☆"}</button>
+        </div>
+        <div class="muted">${esc(facts.join(" · "))}</div>
+      </summary>
+      <h2 style="margin-top:12px">Ingrédients${m.portions ? ` (${esc(m.portions)} portions)` : ""}</h2>
+      <ul class="steps">${m.ingredients.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+      <h2>Préparation</h2>
+      <ol class="steps">${m.steps.map((x) => `<li>${esc(x)}</li>`).join("")}</ol>
+      ${m.tips ? `<p class="note">${esc(m.tips)}</p>` : ""}
+      ${m.fav ? "" : `<button class="small danger" data-action="meal-del" data-id="${m.id}">Retirer</button>`}
+    </details>`;
+}
+
+function viewFood() {
+  const groups = MEAL_TYPES.map(([type, label]) => {
+    const list = state.meals.filter((m) => m.type === type || (type === "repas" && !MEAL_TYPES.some(([t]) => t === m.type)));
+    return list.length ? `<div class="eyebrow" style="margin:18px 0 8px">${label}</div>${list.map(mealCard).join("")}` : "";
+  }).join("");
+  const shop = state.shopping;
+  return `
+    <div class="eyebrow">Idées repas, sans suivi</div>
+    <h1 class="lead">Cuisine</h1>
+    <button class="primary block" style="margin:0 0 6px" data-action="go" data-view="foodPrompt">Demander de nouvelles idées</button>
+    ${groups || `<div class="card"><p class="muted">Aucune idée pour l'instant. Renseigne tes goûts et demande des idées au coach.</p></div>`}
+    ${
+      shop.length
+        ? `<div class="card">
+            <div class="spread"><h2>Liste de courses</h2><button class="small" data-action="shop-clear">Retirer les cochés</button></div>
+            ${shop
+              .map((x, i) => `<button class="shop ${x.done ? "done" : ""}" data-action="shop-toggle" data-i="${i}"><span class="box">${x.done ? "✓" : ""}</span>${esc(x.text)}</button>`)
+              .join("")}
+          </div>`
+        : ""
+    }`;
+}
+
+function viewFoodPrompt() {
+  const f = state.food;
+  const field = (name, label, placeholder) =>
+    `<label>${label}</label><textarea name="${name}" style="min-height:64px" placeholder="${placeholder}">${esc(f[name])}</textarea>`;
+  return `
+    <button class="small" data-action="go" data-view="food">← Retour</button>
+    <div class="eyebrow" style="margin-top:14px">Nouvelles idées</div>
+    <h1 class="lead">Mes goûts</h1>
+    <form data-form="food-prefs" class="card">
+      ${field("likes", "J'aime", "Poulet, riz, pâtes, œufs, fromage blanc…")}
+      ${field("dislikes", "Je n'aime pas / je ne mange pas", "Poisson, champignons, poivrons…")}
+      ${field("allergies", "Allergies / intolérances", "Aucune")}
+      ${field("cooking", "Cuisine", "20 min max en semaine, batch cooking le dimanche, airfryer…")}
+      ${field("other", "Autre", "Budget, cantine le midi, pas de micro-ondes au boulot…")}
+      <button type="submit" class="block">Enregistrer mes goûts</button>
+    </form>
+    <div class="card">
+      <h2>1. Copier la demande</h2>
+      <label>Envie du moment (optionnel)</label>
+      <input name="craving" placeholder="Ex. un truc sucré pour le soir, du mexicain…">
+      <button class="primary block" data-action="copy-food">Copier la demande</button>
+      <a class="btn block" href="${coach().url}" target="_blank" rel="noopener">Ouvrir ${coach().label}</a>
+    </div>
+    <form data-form="food-import" class="card">
+      <h2>2. Importer la réponse</h2>
+      <textarea name="text" style="min-height:160px" placeholder="Colle ici toute la réponse"></textarea>
+      <button type="submit" class="primary block">Importer les idées</button>
+      <p id="food-error" class="note"></p>
+    </form>
+    <p class="muted">Les favoris ★ sont conservés quand tu importes de nouvelles idées.</p>`;
+}
+
 const NAV = [
   ["home", "Accueil", '<path d="M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>'],
   ["history", "Historique", '<path d="M4 5h16M4 12h16M4 19h10"/>'],
   ["body", "Corps", '<path d="M3 17l5-6 4 4 8-9"/><path d="M15 6h5v5"/>'],
+  ["food", "Cuisine", '<path d="M7 3v8a2 2 0 0 0 2 2v8M5 3v5M9 3v5M17 3c-2 2-2 6 0 8v10"/>'],
   ["settings", "Profil", '<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4.5-6 8-6s7 2 8 6"/>'],
 ];
 
 function navBar() {
-  const section = { session: "history", report: "history", workout: "home", finish: "home", import: "home" }[view] || view;
+  const section = { session: "history", report: "history", workout: "home", finish: "home", import: "home", foodPrompt: "food" }[view] || view;
   return `<nav class="tabs">${NAV.map(
     ([v, label, icon]) => `<button class="${section === v ? "on" : ""}" data-action="go" data-view="${v}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon}</svg>${label}</button>`
@@ -942,14 +1245,15 @@ function viewWorkout() {
         <div class="spread">
           <h2>${esc(e.name)}</h2>
           <span class="row" style="flex:0">
+            <button class="small" data-action="work-start" data-ex="${i}" aria-label="Chronomètre">⏱</button>
             <button class="small" data-action="ex-info" data-name="${esc(e.name)}" aria-label="Fiche exercice">ⓘ</button>
             <button class="small danger" data-action="del-ex" data-ex="${i}">✕</button>
           </span>
         </div>
         ${e.note ? `<p class="note">${esc(e.note)}</p>` : ""}
-        ${prev ? `<p class="muted">Dernière fois (${fmtDate(prev.date)}) : ${prev.sets.map(fmtSet).join(", ")}</p>` : ""}
+        ${prev ? `<p class="muted">Dernière fois (${fmtDate(prev.date)}) : ${fmtSets(prev)}</p>` : ""}
         <div class="sets">
-          <div class="set head"><span>#</span><span>kg</span><span>reps</span><button class="link-head" data-action="rpe-help">RPE ⓘ</button><span></span></div>
+          <div class="set head"><span>#</span><span>kg</span><span>${e.timed ? "sec" : "reps"}</span><button class="link-head" data-action="rpe-help">RPE ⓘ</button><span></span></div>
           ${e.sets
             .map(
               (s, j) => `
@@ -975,6 +1279,7 @@ function viewWorkout() {
 
   return `
     <input class="title-input" data-field="name" value="${esc(a.name)}">
+    <button class="small ghost" data-action="rpe-help" style="margin:6px 0">Échelle RPE</button>
     <p class="muted">Débutée ${new Date(a.startedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</p>
     ${a.plan?.notes ? `<p class="note">${esc(a.plan.notes)}</p>` : ""}
     ${exHtml}
@@ -1069,7 +1374,7 @@ function viewSession(id) {
     <h1>${esc(h.name)}</h1>
     <p class="muted">${fmtDate(h.startedAt)} · ${h.durationMin} min</p>
     ${h.exercises
-      .map((e) => `<div class="card"><h2>${esc(e.name)}</h2>${e.sets.map((s, i) => `<p>${i + 1}. ${fmtSet(s)}</p>`).join("")}</div>`)
+      .map((e) => `<div class="card"><h2>${esc(e.name)}</h2>${e.sets.map((s, i) => `<p>${i + 1}. ${fmtSet(s, e.timed)}</p>`).join("")}</div>`)
       .join("")}
     <div class="card">
       <p>Énergie : ${esc(f.energy || "—")}/5 · RPE séance : ${esc(f.sessionRpe || "—")}/10</p>
@@ -1102,6 +1407,11 @@ function viewSettings() {
       <select name="coach">${Object.entries(COACHES)
         .map(([k, c]) => `<option value="${k}" ${k === (p.coach || "claude") ? "selected" : ""}>${c.label}</option>`)
         .join("")}</select>
+      <label>Bips (fin de repos, chrono)</label>
+      <select name="sound">
+        <option value="on" ${p.sound !== "off" ? "selected" : ""}>Activés</option>
+        <option value="off" ${p.sound === "off" ? "selected" : ""}>Désactivés</option>
+      </select>
       <label>Mémoire long terme du coach (un point par ligne)</label>
       <textarea name="coachMemory" style="min-height:160px" placeholder="Mise à jour par le coach à chaque import de plan">${esc(state.coachMemory.join("\n"))}</textarea>
       <button type="submit" class="primary block">Enregistrer</button>
@@ -1144,6 +1454,8 @@ function render() {
     settings: viewSettings,
     body: viewBody,
     exercise: () => viewExercise(viewArg),
+    food: viewFood,
+    foodPrompt: viewFoodPrompt,
   };
   $("#app").innerHTML = (views[view] || viewHome)() + navBar();
 }
@@ -1156,6 +1468,8 @@ document.addEventListener("pointerdown", chartHover);
 document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-action]");
   if (!t || t.tagName === "INPUT") return;
+  // Any tap unlocks audio (browsers block sound until a user gesture).
+  if (soundOn()) audio();
   const ex = Number(t.dataset.ex);
   const set = Number(t.dataset.set);
   const a = state.active;
@@ -1194,14 +1508,25 @@ document.addEventListener("click", async (ev) => {
     case "discard":
       if (!confirm("Abandonner la séance ? Rien ne sera enregistré.")) return;
       state.active = null;
+      work = null;
       save();
       stopRest();
       releaseWakeLock();
       return go("home");
-    case "rest-add":
+    case "rest-add": {
       rest.endAt += Number(t.dataset.s) * 1000;
       rest.buzzed = rest.endAt <= Date.now();
-      return tickRest();
+      cancelBeeps();
+      const left = (rest.endAt - Date.now()) / 1000;
+      if (left > 0) scheduleCountdown(left);
+      return tickBar();
+    }
+    case "work-start":
+      return startWork(ex);
+    case "work-stop":
+      return stopWork(true);
+    case "work-cancel":
+      return stopWork(false);
     case "rest-stop":
       return stopRest();
     case "copy-report": {
@@ -1217,6 +1542,29 @@ document.addEventListener("click", async (ev) => {
         $("#import-error").textContent = "Accès au presse-papier refusé : colle à la main (appui long).";
       }
       return;
+    case "meal-fav": {
+      const m = state.meals.find((x) => x.id === t.dataset.id);
+      m.fav = !m.fav;
+      save();
+      return render();
+    }
+    case "meal-del":
+      state.meals = state.meals.filter((x) => x.id !== t.dataset.id);
+      save();
+      return render();
+    case "shop-toggle":
+      state.shopping[Number(t.dataset.i)].done = !state.shopping[Number(t.dataset.i)].done;
+      save();
+      return render();
+    case "shop-clear":
+      state.shopping = state.shopping.filter((x) => !x.done);
+      save();
+      return render();
+    case "copy-food": {
+      const ok = await copy(buildFoodPrompt(document.querySelector("[name=craving]")?.value || ""));
+      t.textContent = ok ? "Copié ✓" : "Échec : sélectionne le texte à la main";
+      return;
+    }
     case "rpe-help":
       return showRpeHelp();
     case "rpe-close":
@@ -1318,6 +1666,19 @@ document.addEventListener("submit", (ev) => {
       state.coachMemory = f.coachMemory.value.split("\n").map((m) => m.trim()).filter(Boolean);
       save();
       return go("home");
+    case "food-prefs":
+      state.food = Object.fromEntries(Object.keys(defaultState().food).map((k) => [k, f[k].value.trim()]));
+      save();
+      return go("foodPrompt");
+    case "food-import":
+      try {
+        importMeals(extractJson(f.text.value));
+        save();
+        go("food");
+      } catch (err) {
+        $("#food-error").textContent = err.message;
+      }
+      return;
     case "measure": {
       const m = {
         id: `m${Date.now().toString(36)}`,
@@ -1343,7 +1704,14 @@ document.addEventListener("submit", (ev) => {
   }
 });
 
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+if ("serviceWorker" in navigator) {
+  // Reload once when a new deploy takes control, so the phone never runs a stale version.
+  const hadController = Boolean(navigator.serviceWorker.controller);
+  navigator.serviceWorker.addEventListener("controllerchange", () => hadController && location.reload());
+  navigator.serviceWorker.register("sw.js").then((reg) => {
+    document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && reg.update());
+  });
+}
 
 render();
 runSync();

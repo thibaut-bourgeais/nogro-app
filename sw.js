@@ -1,5 +1,5 @@
 // Bump CACHE on every deploy so phones pick up the new version.
-const CACHE = "nogro-v8";
+const CACHE = "nogro-v10";
 // Exercise DB files are pinned to a commit, so cache-first forever is safe.
 const EXDB_CACHE = "nogro-exdb";
 const EXDB_ORIGIN = "https://cdn.jsdelivr.net";

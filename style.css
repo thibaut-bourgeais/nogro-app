@@ -227,3 +227,20 @@ table.rpe th { text-align: left; color: var(--muted); font-size: 11px; text-tran
 table.rpe td { padding: 7px 6px; border-top: 1px solid var(--line); vertical-align: top; }
 table.rpe td:first-child { color: var(--accent); width: 42px; }
 table.rpe td:nth-child(2) { width: 64px; text-align: center; }
+
+/* Bar variants: rest (default), timed-set countdown, running, target reached */
+#rest .time small { display: block; font-size: 12px; font-weight: 600; opacity: 0.75; letter-spacing: 0; }
+#rest.ready { background: #fde68a; }
+#rest.work { background: #fff7ed; }
+#rest.reached { background: var(--ok); }
+
+/* Meal ideas */
+details.meal summary { list-style: none; cursor: pointer; }
+details.meal summary::-webkit-details-marker { display: none; }
+details.meal[open] { background: rgba(74, 26, 8, 0.85); }
+.star { font-size: 18px; min-height: 34px; padding: 2px 10px; }
+.star.on { color: var(--accent); border-color: var(--accent); }
+.shop { display: flex; gap: 10px; align-items: center; width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--line); border-radius: 0; padding: 10px 2px; min-height: 0; font-weight: 400; }
+.shop .box { width: 22px; height: 22px; border: 2px solid var(--muted); border-radius: 6px; display: inline-grid; place-items: center; flex: none; font-size: 14px; }
+.shop.done { color: var(--muted); text-decoration: line-through; }
+.shop.done .box { background: var(--ok); border-color: var(--ok); color: #052e16; }
