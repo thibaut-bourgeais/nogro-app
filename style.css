@@ -244,3 +244,12 @@ details.meal[open] { background: rgba(74, 26, 8, 0.85); }
 .shop .box { width: 22px; height: 22px; border: 2px solid var(--muted); border-radius: 6px; display: inline-grid; place-items: center; flex: none; font-size: 14px; }
 .shop.done { color: var(--muted); text-decoration: line-through; }
 .shop.done .box { background: var(--ok); border-color: var(--ok); color: #052e16; }
+
+/* Exercise reorder + add suggestions */
+.reorder { display: flex; flex-direction: column; gap: 2px; flex: none; }
+.reorder button { min-height: 0; padding: 0 8px; height: 22px; font-size: 11px; line-height: 1; border-radius: 6px; }
+.reorder button:disabled { opacity: 0.25; }
+.suggest-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.suggest { min-height: 36px; padding: 6px 12px; border-radius: 999px; font-size: 14px; font-weight: 600; }
+.suggest.new { background: transparent; border-color: var(--accent); color: var(--accent); }
+.suggest.done { display: inline-flex; align-items: center; background: transparent; border: 1px dashed var(--line); color: var(--muted); font-weight: 500; }

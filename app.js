@@ -130,15 +130,66 @@ function fmtMeasure(m) {
   return `- ${m.date} : ${parts.join(", ")}`;
 }
 
+function deaccent(s) {
+  return s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+}
+
 function sameName(a, b) {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
+// Built-in catalogue of common gym exercises, so a replacement is always one tap away.
+// Names match the ones already used in the log; timed ones log seconds instead of reps.
+const CATALOG = [
+  "Développé couché barre", "Développé couché haltères", "Développé incliné barre", "Développé incliné haltères",
+  "Écarté poulie vis-à-vis", "Dips", "Pompes",
+  "Tirage vertical", "Tirage horizontal poulie", "Tractions", "Rowing barre", "Rowing haltère unilatéral", "Face pull",
+  "Développé militaire barre", "Développé militaire haltères assis", "Élévations latérales haltères", "Oiseau haltères",
+  "Curl biceps haltères", "Curl barre EZ", "Curl marteau", "Extension triceps poulie haute", "Barre au front",
+  "Squat barre", "Goblet squat", "Presse", "Fentes haltères", "Squat bulgare", "Soulevé de terre",
+  "Soulevé de terre roumain haltères", "Hip thrust", "Leg curl assis", "Leg extension", "Mollets debout machine",
+  "Crunch poulie", "Relevé de jambes suspendu", "Gainage planche", "Vélo zone 2", "Rameur",
+];
+const CATALOG_TIMED = new Set(["gainage planche", "velo zone 2", "rameur"]);
+
+// Known exercise names, most used first, then the catalogue. Key = name without case or accents.
 function knownExercises() {
-  const names = new Map();
-  for (const h of state.history) for (const e of h.exercises) names.set(e.name.toLowerCase(), e.name);
-  if (state.plan) for (const e of state.plan.exercises) names.set(e.name.toLowerCase(), e.name);
-  return [...names.values()].sort((a, b) => a.localeCompare(b));
+  const byKey = new Map();
+  const add = (name, uses) => {
+    const k = deaccent(name.trim());
+    const cur = byKey.get(k) || { name: name.trim(), uses: 0 };
+    cur.uses += uses;
+    byKey.set(k, cur);
+  };
+  for (const h of state.history) for (const e of h.exercises) add(e.name, 1);
+  if (state.plan) for (const e of state.plan.exercises) add(e.name, 0.5);
+  for (const n of CATALOG) add(n, 0);
+  return [...byKey.values()].sort((a, b) => b.uses - a.uses || a.name.localeCompare(b.name)).map((x) => x.name);
+}
+
+// Suggestions for the "add exercise" box: every query word must start a word of the name.
+function exSuggestions(query) {
+  const inWorkout = new Set((state.active?.exercises || []).map((e) => deaccent(e.name)));
+  const words = deaccent(query).split(/[^a-z0-9]+/).filter(Boolean);
+  const matches = (n) => {
+    const nw = deaccent(n).split(/[^a-z0-9]+/);
+    return words.every((w) => nw.some((x) => x.startsWith(w)));
+  };
+  // Exercises already in the workout are shown greyed, so a near-duplicate is never added by mistake.
+  const already = words.length ? state.active.exercises.map((e) => e.name).filter(matches) : [];
+  const hits = knownExercises()
+    .filter((n) => !inWorkout.has(deaccent(n)))
+    .filter(matches)
+    .slice(0, 8);
+  const exact = knownExercises().some((n) => deaccent(n) === deaccent(query.trim()));
+  const fresh = query.trim() && !exact
+    ? `<button class="suggest new" data-action="add-ex-name" data-name="${esc(query.trim())}">+ Nouvel exercice « ${esc(query.trim())} »</button>`
+    : "";
+  return (
+    already.map((n) => `<span class="suggest done">${esc(n)} · déjà dans la séance</span>`).join("") +
+    hits.map((n) => `<button class="suggest" data-action="add-ex-name" data-name="${esc(n)}">${esc(n)}</button>`).join("") +
+    fresh
+  );
 }
 
 function lastPerf(name) {
@@ -182,12 +233,15 @@ function startWorkout(fromPlan) {
 function addExercise(name) {
   name = name.trim();
   if (!name) return;
+  // Reuse the exact known spelling, so the coach sees one name per exercise.
+  name = knownExercises().find((n) => deaccent(n) === deaccent(name)) || name;
   const prev = lastPerf(name);
   const seed = prev?.sets.at(-1);
   state.active.exercises.push({
     name,
     restS: REST_DEFAULT_S,
     note: "",
+    timed: Boolean(prev?.timed ?? CATALOG_TIMED.has(deaccent(name))),
     sets: [{ kg: seed?.kg ?? "", reps: seed?.reps ?? "", rpe: "", done: false }],
   });
   save();
@@ -682,7 +736,7 @@ function buildReport(session) {
 
   const progress = longTermProgress(idx);
 
-  return `Tu es mon coach de musculation. Analyse ma séance du jour et mon historique, puis planifie ma prochaine séance.
+  const body = `Tu es mon coach de musculation. Analyse ma séance du jour et mon historique, puis planifie ma prochaine séance.
 ${COACH_GUIDE}
 ## Format de réponse
 1. Une analyse courte (5 lignes maximum) : ce qui a progressé, ce qui coince, la décision pour la suite.
@@ -702,13 +756,19 @@ ${state.coachMemory.length ? state.coachMemory.map((m) => `- ${m}`).join("\n") :
 
 ## Progression long terme (meilleur 1RM estimé par mois, kg)
 ${progress.length ? progress.join("\n") : "- (pas assez de données)"}
-${planVsDone}
-## Séance du jour
-${sessionBlock(session)}
 
-## Historique récent
+## Historique récent (du plus ancien au plus récent, séance du jour exclue)
 ${past.length ? past.map(sessionBlock).join("\n\n") : "(aucune séance précédente)"}
+${planVsDone}
+## Séance du jour (la plus récente)
+${sessionBlock(session)}
 `;
+  // Last line lets the user check at a glance that the paste is complete.
+  return `${body.trimEnd()}\n\n${reportEndMarker(idx + 1, body.length)}\n`;
+}
+
+function reportEndMarker(sessions, chars) {
+  return `— FIN DU COMPTE RENDU · ${sessions} séances · ${chars.toLocaleString("fr-FR")} caractères —`;
 }
 
 function extractJson(text) {
@@ -923,7 +983,7 @@ function loadExdb() {
     .finally(() => view === "exercise" && render());
 }
 
-const deaccent = (s) => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+
 
 // French gym vocabulary -> English words used by the database. Longest phrases first.
 const FR_EN = [
@@ -1243,7 +1303,11 @@ function viewWorkout() {
       return `
       <div class="card">
         <div class="spread">
-          <h2>${esc(e.name)}</h2>
+          <span class="reorder">
+            <button data-action="ex-move" data-ex="${i}" data-dir="-1" ${i === 0 ? "disabled" : ""} aria-label="Monter">▲</button>
+            <button data-action="ex-move" data-ex="${i}" data-dir="1" ${i === a.exercises.length - 1 ? "disabled" : ""} aria-label="Descendre">▼</button>
+          </span>
+          <h2 style="flex:1">${esc(e.name)}</h2>
           <span class="row" style="flex:0">
             <button class="small" data-action="work-start" data-ex="${i}" aria-label="Chronomètre">⏱</button>
             <button class="small" data-action="ex-info" data-name="${esc(e.name)}" aria-label="Fiche exercice">ⓘ</button>
@@ -1285,10 +1349,10 @@ function viewWorkout() {
     ${exHtml}
     <div class="card">
       <form data-form="add-ex" class="row">
-        <input name="exName" list="exlist" placeholder="Ajouter un exercice" autocomplete="off">
+        <input name="exName" id="ex-add" placeholder="Ajouter un exercice" autocomplete="off">
         <button type="submit" style="flex:0">+</button>
       </form>
-      <datalist id="exlist">${knownExercises().map((n) => `<option value="${esc(n)}">`).join("")}</datalist>
+      <div id="ex-suggest" class="suggest-list"></div>
     </div>
     <button class="primary block" data-action="go" data-view="finish">Terminer la séance</button>
     <div class="row" style="margin-top:8px">
@@ -1325,7 +1389,9 @@ function viewReport(id) {
   return `
     <h1>Compte rendu</h1>
     <p class="muted">1. Copie le texte. 2. Colle-le dans ${coach().label}. 3. Copie sa réponse et importe-la ici.</p>
+    <p class="note">Le texte collé doit finir par « — FIN DU COMPTE RENDU — ». La séance du jour est juste avant.</p>
     <button class="primary block" data-action="copy-report" data-id="${id}">Copier le compte rendu</button>
+    ${navigator.share ? `<button class="block" data-action="share-report" data-id="${id}">Partager vers une app…</button>` : ""}
     <a class="btn block" href="${coach().url}" target="_blank" rel="noopener">Ouvrir ${coach().label}</a>
     <button class="block" data-action="go" data-view="import">Importer la réponse du coach</button>
     <textarea readonly style="min-height:320px;margin-top:12px;font-size:13px">${esc(buildReport(session))}</textarea>
@@ -1461,6 +1527,10 @@ function render() {
 }
 
 document.addEventListener("pointermove", chartHover);
+// Show known exercises as soon as the "add exercise" box gets focus.
+document.addEventListener("focusin", (ev) => {
+  if (ev.target.id === "ex-add") $("#ex-suggest").innerHTML = exSuggestions(ev.target.value);
+});
 document.addEventListener("pointerdown", chartHover);
 
 // ---------- events ----------
@@ -1489,6 +1559,17 @@ document.addEventListener("click", async (ev) => {
       if (s.done) startRest(Number(a.exercises[ex].restS) || REST_DEFAULT_S);
       return;
     }
+    case "ex-move": {
+      const to = ex + Number(t.dataset.dir);
+      if (to < 0 || to >= a.exercises.length) return;
+      [a.exercises[ex], a.exercises[to]] = [a.exercises[to], a.exercises[ex]];
+      // Keep a running stopwatch on the same exercise.
+      if (work) work.ex = work.ex === ex ? to : work.ex === to ? ex : work.ex;
+      save();
+      return render();
+    }
+    case "add-ex-name":
+      return addExercise(t.dataset.name);
     case "add-set": {
       const sets = a.exercises[ex].sets;
       const last = sets.at(-1);
@@ -1533,6 +1614,14 @@ document.addEventListener("click", async (ev) => {
       const session = state.history.find((h) => h.id === t.dataset.id);
       const ok = await copy(buildReport(session));
       t.textContent = ok ? "Copié ✓" : "Échec : sélectionne le texte à la main";
+      return;
+    }
+    case "share-report": {
+      // Call share() before any await: Android drops the user gesture otherwise.
+      const session = state.history.find((h) => h.id === t.dataset.id);
+      navigator.share({ text: buildReport(session) }).catch((err) => {
+        if (err.name !== "AbortError") t.textContent = "Partage impossible : utilise Copier";
+      });
       return;
     }
     case "paste":
@@ -1603,6 +1692,10 @@ document.addEventListener("click", async (ev) => {
 
 document.addEventListener("input", (ev) => {
   const t = ev.target;
+  if (t.id === "ex-add") {
+    $("#ex-suggest").innerHTML = exSuggestions(t.value);
+    return;
+  }
   if (t.id === "exdb-q") {
     $("#exdb-results").innerHTML = exdbResults(t.value);
     return;
