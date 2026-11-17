@@ -114,7 +114,7 @@ label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--muted)
 .sets { display: grid; gap: 6px; margin-top: 10px; }
 .set {
   display: grid;
-  grid-template-columns: 26px 1fr 1fr 1fr 46px;
+  grid-template-columns: 22px 54px 1fr 1fr 1fr 44px;
   gap: 6px;
   align-items: center;
 }
@@ -253,3 +253,24 @@ details.meal[open] { background: rgba(74, 26, 8, 0.85); }
 .suggest { min-height: 36px; padding: 6px 12px; border-radius: 999px; font-size: 14px; font-weight: 600; }
 .suggest.new { background: transparent; border-color: var(--accent); color: var(--accent); }
 .suggest.done { display: inline-flex; align-items: center; background: transparent; border: 1px dashed var(--line); color: var(--muted); font-weight: 500; }
+.ex-comment { margin-top: 8px; font-size: 14px; padding: 8px 10px; }
+
+/* Muscle radar (single series; target ring is a reference band, not a series) */
+.radar { display: block; width: 100%; height: auto; overflow: visible; }
+.radar-grid { fill: none; stroke: rgba(255, 237, 213, 0.14); stroke-width: 1; }
+.radar-target { fill: rgba(255, 209, 102, 0.14); stroke: none; }
+.radar-area { fill: rgba(255, 209, 102, 0.28); stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+.radar-dot { fill: var(--accent); stroke: var(--card-solid); stroke-width: 2; }
+.radar-label { fill: var(--muted); font-size: 12px; font-weight: 600; }
+.radar-val { fill: var(--text); font-size: 14px; font-weight: 800; }
+.seg { display: inline-flex; gap: 4px; flex: none; }
+.seg button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.set .prev { font-size: 12px; white-space: nowrap; color: var(--muted); text-align: center; line-height: 1.2; overflow-wrap: anywhere; }
+
+/* History calendar */
+.cal { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 8px; }
+.cal-head { text-align: center; font-size: 11px; color: var(--muted); font-weight: 700; }
+.cal-cell { aspect-ratio: 1; display: grid; place-items: center; border-radius: 10px; font-size: 14px; color: var(--muted); background: rgba(0, 0, 0, 0.15); padding: 0; min-height: 0; border: 1px solid transparent; font-weight: 600; }
+.cal-cell.empty { background: none; }
+.cal-cell.has { background: var(--accent); color: var(--accent-ink); font-weight: 800; }
+.cal-cell.today { border-color: var(--text); }

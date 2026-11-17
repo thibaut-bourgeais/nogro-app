@@ -152,6 +152,87 @@ const CATALOG = [
 ];
 const CATALOG_TIMED = new Set(["gainage planche", "velo zone 2", "rameur"]);
 
+// ---------- muscle groups & weekly volume ----------
+
+// Radar axes: one per muscle, because the 10-16 sets target is per muscle.
+const MUSCLE_GROUPS = ["Pectoraux", "Dos", "Épaules", "Biceps", "Triceps", "Quadriceps", "Ischios-fessiers", "Abdos"];
+// Counted and reported, but no target and no radar axis.
+const EXTRA_GROUPS = ["Mollets"];
+
+// First matching rule wins, so specific names come before generic words
+// ("mollets sur presse" before "presse", "relevé de jambes" before leg words, "face pull" before "pull").
+// Weights: 1 = primary muscle, 0.5 = secondary muscle.
+const MUSCLE_RULES = [
+  [/gainage|planche|crunch|releve de jambes|abdo|roue abdominale|russian twist/, { Abdos: 1 }],
+  [/\bvelo\b|\brameur\b|\btapis\b|elliptique|cardio|corde a sauter|\bmarche\b/, {}],
+  [/face pull|oiseau|reverse fly/, { Épaules: 1, Dos: 0.5 }],
+  [/developpe militaire|arnold|shoulder press|developpe epaules/, { Épaules: 1, Triceps: 0.5 }],
+  [/elevation|epaule|shrug|trapeze/, { Épaules: 1 }],
+  [/souleve de terre|deadlift|good morning/, { "Ischios-fessiers": 1, Dos: 0.5 }],
+  [/mollet|calf/, { Mollets: 1 }],
+  [/leg curl|ischio|hip thrust|fessier|glute|abducteur/, { "Ischios-fessiers": 1 }],
+  [/leg extension/, { Quadriceps: 1 }],
+  [/presse|squat|fente|leg press|step up|quadri|adducteur/, { Quadriceps: 1, "Ischios-fessiers": 0.5 }],
+  [/ecarte|butterfly|pec deck|cable fly/, { Pectoraux: 1 }],
+  [/developpe couche|developpe incline|developpe decline|pompe|dips|bench|pectoraux/, { Pectoraux: 1, Triceps: 0.5 }],
+  [/tirage|rowing|traction|pull|lat |dos/, { Dos: 1, Biceps: 0.5 }],
+  [/triceps|barre au front|kickback/, { Triceps: 1 }],
+  [/curl|biceps|marteau/, { Biceps: 1 }],
+];
+
+// Returns { group: weight }, {} for cardio, or null when the name is not recognised.
+function muscleGroups(name) {
+  const n = ` ${deaccent(name)} `;
+  for (const [re, groups] of MUSCLE_RULES) if (re.test(n)) return groups;
+  return null;
+}
+
+// Local calendar day, as YYYY-MM-DD (startedAt is UTC).
+function localDay(isoOrDate) {
+  const d = new Date(isoOrDate);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function addDays(day, n) {
+  const d = new Date(`${day}T12:00:00`);
+  d.setDate(d.getDate() + n);
+  return localDay(d);
+}
+
+// Effective sets per group over the `days` days ending on `endDay` (included).
+// Warm-up sets (RPE ≤ 5) do not count; secondary muscles count half.
+function weeklyVolume(endDay, days = 7) {
+  const startDay = addDays(endDay, -(days - 1));
+  const vol = Object.fromEntries([...MUSCLE_GROUPS, ...EXTRA_GROUPS].map((g) => [g, 0]));
+  const unknown = new Set();
+  let sessions = 0;
+  for (const h of state.history) {
+    const day = localDay(h.startedAt);
+    if (day < startDay || day > endDay) continue;
+    sessions++;
+    for (const e of h.exercises) {
+      const groups = muscleGroups(e.name);
+      if (!groups) unknown.add(e.name);
+      const sets = e.sets.filter((s) => !(typeof s.rpe === "number" && s.rpe <= 5)).length;
+      for (const [g, w] of Object.entries(groups || {})) vol[g] += sets * w;
+    }
+  }
+  // Weeks actually covered: the window may start before the first session.
+  const first = state.history.length ? localDay(state.history[0].startedAt) : endDay;
+  const from = first > startDay ? first : startDay;
+  const coveredDays = Math.round((new Date(`${endDay}T12:00:00`) - new Date(`${from}T12:00:00`)) / 86400000) + 1;
+  const weeks = Math.max(1, coveredDays / 7);
+  return { startDay, endDay, sessions, vol, weeks, unknown: [...unknown] };
+}
+
+const fmtDayShort = (day) => new Date(`${day}T12:00:00`).toLocaleDateString("fr-FR", { day: "numeric", month: "short" });
+
+function fmtVolume(v) {
+  const f = (g) => `${g} ${Math.round(v.vol[g] * 10) / 10}`;
+  return MUSCLE_GROUPS.map(f).join(" · ") + ` (hors cible : ${EXTRA_GROUPS.map(f).join(" · ")})` +
+    (v.unknown.length ? `\n  (non classés : ${v.unknown.join(", ")})` : "");
+}
+
 // Known exercise names, most used first, then the catalogue. Key = name without case or accents.
 function knownExercises() {
   const byKey = new Map();
@@ -195,7 +276,7 @@ function exSuggestions(query) {
 function lastPerf(name) {
   for (let i = state.history.length - 1; i >= 0; i--) {
     const ex = state.history[i].exercises.find((e) => sameName(e.name, name));
-    if (ex) return { date: state.history[i].startedAt, sets: ex.sets, timed: ex.timed };
+    if (ex) return { date: state.history[i].startedAt, sets: ex.sets, timed: ex.timed, comment: ex.comment };
   }
   return null;
 }
@@ -254,6 +335,7 @@ function finishWorkout(form) {
     .map((e) => ({
       name: e.name,
       ...(e.timed ? { timed: true } : {}),
+      ...(e.comment?.trim() ? { comment: e.comment.trim() } : {}),
       sets: e.sets.filter((s) => s.done && s.reps !== "").map(({ kg, reps, rpe }) => ({ kg, reps, rpe })),
     }))
     .filter((e) => e.sets.length);
@@ -626,6 +708,9 @@ const COACH_GUIDE = `
 - Tu n'as pas d'autre mémoire que ce message. "Mémoire long terme" est ta mémoire : renvoie-la EN ENTIER dans
   "memory", mise à jour (cycle et semaine en cours, blessures, ce qui marche ou pas, préférences, décisions).
   Garde les points encore valides, retire les obsolètes, 15 points maximum.
+  Ne recopie pas les mesures (poids, masse grasse) ni le détail des séances dans "memory" : le compte rendu les envoie déjà.
+- "Volume" = séries effectives par muscle, calculées par l'app (échauffements exclus, muscle secondaire = 0,5).
+  Sers-t'en pour viser 10 à 16 séries par muscle sur 7 jours et combler les muscles en retard. Mollets : pas de cible.
 - Raisonne en cycles de 4 à 6 semaines : progression, puis une semaine de décharge (volume −40 %, RPE ≤ 7).
   Indique le cycle et la semaine dans "memory" et dans le "name" de la séance (ex. "C1 S3 · Full body A").
 - Progression double : garde la charge tant que toutes les séries n'atteignent pas le haut de la fourchette de reps
@@ -664,7 +749,7 @@ const PLAN_FORMAT = `{
 
 function sessionBlock(h) {
   const lines = [`### ${isoDay(h.startedAt)} — ${h.name} (${h.durationMin} min)`];
-  for (const e of h.exercises) lines.push(`- ${e.name} : ${fmtSets(e)}`);
+  for (const e of h.exercises) lines.push(`- ${e.name} : ${fmtSets(e)}${e.comment ? ` (ressenti : ${e.comment})` : ""}`);
   const f = h.feedback || {};
   const fb = [
     f.energy && `énergie ${f.energy}/5`,
@@ -681,6 +766,34 @@ function e1rm(s) {
   if (typeof s.kg !== "number" || typeof s.reps !== "number" || s.reps < 1 || s.reps > 12) return 0;
   return s.kg * (1 + s.reps / 30);
 }
+
+// Best e1RM per exercise in session `idx`, compared with all earlier sessions.
+// No record the first time an exercise appears, nor for bodyweight or timed sets.
+function sessionRecords(idx) {
+  const h = state.history[idx];
+  if (!h) return [];
+  const out = [];
+  for (const e of h.exercises) {
+    if (e.timed) continue;
+    const best = e.sets.reduce((a, s) => (e1rm(s) > e1rm(a) ? s : a), e.sets[0]);
+    if (!e1rm(best)) continue;
+    let before = 0;
+    for (const p of state.history.slice(0, idx))
+      for (const pe of p.exercises) if (sameName(pe.name, e.name) && !pe.timed) before = Math.max(before, ...pe.sets.map(e1rm));
+    if (before && e1rm(best) > before) out.push({ name: e.name, set: best, e1rm: e1rm(best), before });
+  }
+  return out;
+}
+
+// Best estimated 1RM for an exercise over the finished sessions (0 if none).
+function bestE1rm(name) {
+  let best = 0;
+  for (const h of state.history)
+    for (const e of h.exercises) if (!e.timed && sameName(e.name, name)) best = Math.max(best, ...e.sets.map(e1rm));
+  return best;
+}
+
+const fmtRecord = (r) => `${r.name} ${fmtSet(r.set)} (1RM estimé ${Math.round(r.e1rm)} kg, ancien ${Math.round(r.before)} kg)`;
 
 // One line per exercise over the whole history: best estimated 1RM per month, last months only.
 function longTermProgress(upTo) {
@@ -735,6 +848,8 @@ function buildReport(session) {
   }
 
   const progress = longTermProgress(idx);
+  const vol = weeklyVolume(localDay(session.startedAt));
+  const records = sessionRecords(idx);
 
   const body = `Tu es mon coach de musculation. Analyse ma séance du jour et mon historique, puis planifie ma prochaine séance.
 ${COACH_GUIDE}
@@ -760,11 +875,78 @@ ${progress.length ? progress.join("\n") : "- (pas assez de données)"}
 ## Historique récent (du plus ancien au plus récent, séance du jour exclue)
 ${past.length ? past.map(sessionBlock).join("\n\n") : "(aucune séance précédente)"}
 ${planVsDone}
+## Volume des 7 derniers jours (${fmtDayShort(vol.startDay)} – ${fmtDayShort(vol.endDay)}, ${vol.sessions} séances, séance du jour incluse)
+Séries effectives par muscle (cible 10-16 par muscle) : ${fmtVolume(vol)}
+
 ## Séance du jour (la plus récente)
 ${sessionBlock(session)}
-`;
+${records.length ? `- Records : ${records.map(fmtRecord).join(" ; ")}\n` : ""}`;
   // Last line lets the user check at a glance that the paste is complete.
   return `${body.trimEnd()}\n\n${reportEndMarker(idx + 1, body.length)}\n`;
+}
+
+// Mean weight over the `days` days ending on `endDay`, or null without a weigh-in.
+function meanWeight(endDay, days = 7) {
+  const startDay = addDays(endDay, -(days - 1));
+  const ws = state.measurements.filter((m) => m.date >= startDay && m.date <= endDay && typeof m.weightKg === "number");
+  return ws.length ? { kg: ws.reduce((a, m) => a + m.weightKg, 0) / ws.length, n: ws.length } : null;
+}
+
+// Weekly review: same response format as a session report, so the plan importer handles it.
+function buildWeeklyReview(endDay = localDay(new Date())) {
+  const prevEnd = addDays(endDay, -7);
+  const vol = weeklyVolume(endDay);
+  const volPrev = weeklyVolume(prevEnd);
+  const w = meanWeight(endDay);
+  const wPrev = meanWeight(prevEnd);
+  const startDay = addDays(endDay, -6);
+  const idxs = state.history.map((h, i) => i).filter((i) => {
+    const d = localDay(state.history[i].startedAt);
+    return d >= startDay && d <= endDay;
+  });
+  const week = idxs.map((i) => state.history[i]);
+  const energies = week.map((h) => num(h.feedback?.energy)).filter((x) => x !== "");
+  const records = idxs.flatMap(sessionRecords);
+  const fmtW = (x) => (x ? `${x.kg.toFixed(1).replace(".", ",")} kg (${x.n} pesées)` : "pas de pesée");
+  const delta = w && wPrev ? `${w.kg - wPrev.kg > 0 ? "+" : ""}${(w.kg - wPrev.kg).toFixed(1).replace(".", ",")} kg/semaine` : "non calculable";
+  const p = state.profile;
+  const plan = state.plan;
+
+  const body = `Tu es mon coach de musculation. Fais le BILAN DE MA SEMAINE, ajuste le cycle, le volume et la nutrition,
+puis planifie ma prochaine séance en tenant compte de ce bilan.
+${COACH_GUIDE}
+## Format de réponse
+1. Bilan (10 lignes maximum) : progression, volume par muscle vs cible, tendance du poids vs objectif, énergie.
+2. Ajustements pour la semaine à venir : volume, répartition par muscle, et 2-3 conseils nutrition concrets.
+3. La prochaine séance dans UN SEUL bloc \`\`\`json, au même format que d'habitude (avec "memory" mis à jour) :
+${PLAN_FORMAT}
+Contraintes JSON : JSON strict, nombres sans unité, une entrée par série dans "sets". Pas d'autre bloc de code.
+
+## Profil
+- Objectifs : ${p.goals || "(non renseigné)"}
+${p.schedule ? `- Fréquence : ${p.schedule}\n` : ""}${p.constraints ? `- Contraintes : ${p.constraints}\n` : ""}
+## Mémoire long terme
+${state.coachMemory.length ? state.coachMemory.map((m) => `- ${m}`).join("\n") : "- (vide)"}
+
+## Poids (moyennes sur 7 jours)
+- ${fmtDayShort(startDay)} – ${fmtDayShort(endDay)} : ${fmtW(w)}
+- 7 jours précédents : ${fmtW(wPrev)}
+- Tendance : ${delta} (cible : −0,4 à −0,7 kg/semaine)
+${state.measurements.length ? `- Dernière mesure complète : ${fmtMeasure(state.measurements.at(-1)).slice(2)}` : ""}
+
+## Volume (séries effectives par muscle, échauffements exclus, muscle secondaire = 0,5 ; cible 10-16 par muscle)
+- ${fmtDayShort(vol.startDay)} – ${fmtDayShort(vol.endDay)} (${vol.sessions} séances) : ${fmtVolume(vol)}
+- 7 jours précédents (${volPrev.sessions} séances) : ${fmtVolume(volPrev)}
+
+## Séances de la semaine
+${week.length ? week.map(sessionBlock).join("\n\n") : "(aucune séance cette semaine)"}
+- Énergie moyenne : ${energies.length ? `${(energies.reduce((a, x) => a + x, 0) / energies.length).toFixed(1)}/5` : "non renseignée"}
+${records.length ? `- Records de la semaine : ${records.map(fmtRecord).join(" ; ")}` : "- Pas de record cette semaine"}
+
+## Séance actuellement prévue (à ajuster ou remplacer)
+${plan ? `### ${plan.name}\n${plan.exercises.map((e) => `- ${e.name} : ${fmtSets(e)}`).join("\n")}` : "(aucune)"}
+`;
+  return `${body.trimEnd()}\n\n${reportEndMarker(week.length, body.length)}\n`;
 }
 
 function reportEndMarker(sessions, chars) {
@@ -1286,7 +1468,7 @@ const NAV = [
 ];
 
 function navBar() {
-  const section = { session: "history", report: "history", workout: "home", finish: "home", import: "home", foodPrompt: "food" }[view] || view;
+  const section = { session: "history", report: "history", workout: "home", finish: "home", import: "home", importCheck: "home", foodPrompt: "food" }[view] || view;
   return `<nav class="tabs">${NAV.map(
     ([v, label, icon]) => `<button class="${section === v ? "on" : ""}" data-action="go" data-view="${v}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon}</svg>${label}</button>`
@@ -1300,6 +1482,7 @@ function viewWorkout() {
   const exHtml = a.exercises
     .map((e, i) => {
       const prev = lastPerf(e.name);
+      const best = bestE1rm(e.name);
       return `
       <div class="card">
         <div class="spread">
@@ -1315,19 +1498,24 @@ function viewWorkout() {
           </span>
         </div>
         ${e.note ? `<p class="note">${esc(e.note)}</p>` : ""}
-        ${prev ? `<p class="muted">Dernière fois (${fmtDate(prev.date)}) : ${fmtSets(prev)}</p>` : ""}
+        ${prev ? `<p class="muted">Dernière fois (${fmtDate(prev.date)}) : ${fmtSets(prev)}${prev.comment ? ` · « ${esc(prev.comment)} »` : ""}</p>` : ""}
         <div class="sets">
-          <div class="set head"><span>#</span><span>kg</span><span>${e.timed ? "sec" : "reps"}</span><button class="link-head" data-action="rpe-help">RPE ⓘ</button><span></span></div>
+          <div class="set head"><span>#</span><span>Préc.</span><span>kg</span><span>${e.timed ? "sec" : "reps"}</span><button class="link-head" data-action="rpe-help">RPE ⓘ</button><span></span></div>
           ${e.sets
             .map(
-              (s, j) => `
+              (s, j) => {
+                const p = prev?.sets[j];
+                const pr = s.done && !e.timed && best && e1rm(s) > best;
+                return `
             <div class="set ${s.done ? "done" : ""}">
-              <span class="num">${j + 1}</span>
+              <span class="num" ${pr ? 'title="Record"' : ""}>${pr ? "🏆" : j + 1}</span>
+              <span class="prev">${p ? esc(prev.timed ? `${p.reps} s` : `${p.kg === "" || p.kg === undefined ? "" : p.kg}×${p.reps}`) : "—"}</span>
               <input inputmode="decimal" data-field="kg" data-ex="${i}" data-set="${j}" value="${esc(s.kg)}">
               <input inputmode="numeric" data-field="reps" data-ex="${i}" data-set="${j}" value="${esc(s.reps)}">
               <input inputmode="decimal" data-field="rpe" data-ex="${i}" data-set="${j}" value="${esc(s.rpe)}">
               <button class="check" data-action="toggle-set" data-ex="${i}" data-set="${j}">✓</button>
-            </div>`
+            </div>`;
+              }
             )
             .join("")}
         </div>
@@ -1337,6 +1525,7 @@ function viewWorkout() {
           <label class="muted" style="margin:0;text-align:right">Repos (s)</label>
           <input inputmode="numeric" data-field="restS" data-ex="${i}" value="${esc(e.restS)}" style="padding:6px">
         </div>
+        <input class="ex-comment" data-field="comment" data-ex="${i}" value="${esc(e.comment ?? "")}" placeholder="Ressenti, gêne, réglage machine…" autocomplete="off">
       </div>`;
     })
     .join("");
@@ -1383,19 +1572,107 @@ function viewFinish() {
     <button class="block" data-action="go" data-view="workout">Retour à la séance</button>`;
 }
 
-function viewReport(id) {
+// Text sent to the coach: a session report, or the weekly review when id is "weekly".
+function reportText(id) {
+  if (id === "weekly") return buildWeeklyReview();
   const session = state.history.find((h) => h.id === id);
-  if (!session) return viewHome();
+  return session ? buildReport(session) : "";
+}
+
+function viewReport(id) {
+  const weekly = id === "weekly";
+  if (!weekly && !state.history.some((h) => h.id === id)) return viewHome();
+  const idx = state.history.findIndex((h) => h.id === id);
+  const records = weekly ? [] : sessionRecords(idx);
   return `
-    <h1>Compte rendu</h1>
+    <h1>${weekly ? "Bilan de la semaine" : "Compte rendu"}</h1>
+    ${records.length ? `<div class="card hero"><h2>🏆 ${records.length} record${records.length > 1 ? "s" : ""}</h2>${records.map((r) => `<p>${esc(r.name)} : <strong>${esc(fmtSet(r.set))}</strong> <span class="muted">1RM estimé ${Math.round(r.e1rm)} kg (avant ${Math.round(r.before)})</span></p>`).join("")}</div>` : ""}
     <p class="muted">1. Copie le texte. 2. Colle-le dans ${coach().label}. 3. Copie sa réponse et importe-la ici.</p>
-    <p class="note">Le texte collé doit finir par « — FIN DU COMPTE RENDU — ». La séance du jour est juste avant.</p>
+    <p class="note">Le texte collé doit finir par « — FIN DU COMPTE RENDU — ».${weekly ? "" : " La séance du jour est juste avant."}</p>
     <button class="primary block" data-action="copy-report" data-id="${id}">Copier le compte rendu</button>
     ${navigator.share ? `<button class="block" data-action="share-report" data-id="${id}">Partager vers une app…</button>` : ""}
     <a class="btn block" href="${coach().url}" target="_blank" rel="noopener">Ouvrir ${coach().label}</a>
     <button class="block" data-action="go" data-view="import">Importer la réponse du coach</button>
-    <textarea readonly style="min-height:320px;margin-top:12px;font-size:13px">${esc(buildReport(session))}</textarea>
+    <textarea readonly style="min-height:320px;margin-top:12px;font-size:13px">${esc(reportText(id))}</textarea>
     <button class="block" data-action="go" data-view="home">Accueil</button>`;
+}
+
+// Plan import check: catch names the coach wrote slightly differently from known ones,
+// so history, records and volume stay on one name per exercise.
+let pendingImport = null; // { plan, memory, suspects: [{ name, suggestion, use }] }
+
+const nameWords = (n) => deaccent(n).split(/[^a-z0-9]+/).filter((w) => w.length >= 3);
+
+// Share of words in common (prefix match, so "haltere" ~ "halteres"); 1 = same words.
+function nameSimilarity(a, b) {
+  const wa = nameWords(a), wb = nameWords(b);
+  if (!wa.length || !wb.length) return 0;
+  const hit = (w, list) => list.some((x) => x.startsWith(w) || w.startsWith(x));
+  const common = wa.filter((w) => hit(w, wb)).length;
+  return common / Math.max(wa.length, wb.length);
+}
+
+// Names used in the log first: they carry the history worth protecting.
+function closestKnownName(name) {
+  const used = new Set(state.history.flatMap((h) => h.exercises.map((e) => deaccent(e.name))));
+  let best = null;
+  for (const k of knownExercises()) {
+    if (deaccent(k) === deaccent(name)) return { name: k, score: 1, exact: true };
+    const score = nameSimilarity(name, k) + (used.has(deaccent(k)) ? 0.05 : 0);
+    if (score >= 0.5 && (!best || score > best.score)) best = { name: k, score, exact: false };
+  }
+  return best;
+}
+
+// Default answer: same exercise when the coach's words are all in the known name ("Gainage" ->
+// "Gainage planche"), or same word count with most words shared. A longer name is likely a variant.
+function likelySame(name, known) {
+  const wn = nameWords(name), wk = nameWords(known);
+  const hit = (w, list) => list.some((x) => x.startsWith(w) || w.startsWith(x));
+  return wn.every((w) => hit(w, wk)) || (wn.length === wk.length && nameSimilarity(name, known) >= 0.75);
+}
+
+function checkPlanNames(plan) {
+  const suspects = [];
+  for (const e of plan.exercises) {
+    const m = closestKnownName(e.name);
+    if (m?.exact) e.name = m.name; // same name, other case or accents: fix silently
+    else if (m) suspects.push({ name: e.name, suggestion: m.name, use: likelySame(e.name, m.name) });
+  }
+  return suspects;
+}
+
+function applyImport({ plan, memory, suspects = [] }) {
+  for (const s of suspects) if (s.use) for (const e of plan.exercises) if (e.name === s.name) e.name = s.suggestion;
+  state.plan = plan;
+  if (memory) state.coachMemory = memory;
+  pendingImport = null;
+  save();
+  go("home");
+}
+
+function viewImportCheck() {
+  if (!pendingImport) return viewImport();
+  return `
+    <div class="eyebrow">Import du plan</div>
+    <h1 class="lead">Noms à vérifier</h1>
+    <p class="muted">Ces exercices ressemblent à des exercices que tu connais déjà. Garder un seul nom par exercice
+      préserve ton historique, tes records et le volume par muscle.</p>
+    ${pendingImport.suspects
+      .map(
+        (s, i) => `
+      <div class="card">
+        <p class="muted">Le coach a écrit</p>
+        <p><strong>${esc(s.name)}</strong></p>
+        <div class="row" style="margin-top:8px">
+          <button class="small ${s.use ? "primary" : ""}" data-action="suspect" data-i="${i}" data-use="1">Utiliser « ${esc(s.suggestion)} »</button>
+          <button class="small ${s.use ? "" : "primary"}" data-action="suspect" data-i="${i}" data-use="0">Garder</button>
+        </div>
+      </div>`
+      )
+      .join("")}
+    <button class="primary block" data-action="import-confirm">Valider l'import</button>
+    <button class="block" data-action="import-cancel">Annuler</button>`;
 }
 
 function viewImport() {
@@ -1412,13 +1689,127 @@ function viewImport() {
     <button class="block" data-action="go" data-view="home">Annuler</button>`;
 }
 
+// History as a month calendar: one cell per day, sessions highlighted, tap to open.
+let historyMode = (() => {
+  try {
+    return localStorage.getItem("nogro.historyMode") || "list";
+  } catch {
+    return "list";
+  }
+})();
+let calMonth = localDay(new Date()).slice(0, 7); // "YYYY-MM"
+
+function addMonths(ym, n) {
+  const [y, m] = ym.split("-").map(Number);
+  const d = new Date(y, m - 1 + n, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function calendarView() {
+  const [y, m] = calMonth.split("-").map(Number);
+  const first = new Date(y, m - 1, 1);
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const lead = (first.getDay() + 6) % 7; // Monday first
+  const today = localDay(new Date());
+  const byDay = new Map();
+  for (const h of state.history) {
+    const d = localDay(h.startedAt);
+    byDay.set(d, [...(byDay.get(d) || []), h]);
+  }
+  const monthCount = state.history.filter((h) => localDay(h.startedAt).startsWith(calMonth)).length;
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push(`<span class="cal-cell empty"></span>`);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const day = `${calMonth}-${String(d).padStart(2, "0")}`;
+    const hs = byDay.get(day) || [];
+    const cls = `cal-cell${hs.length ? " has" : ""}${day === today ? " today" : ""}`;
+    cells.push(
+      hs.length
+        ? `<button class="${cls}" data-action="go" data-view="session" data-id="${hs[0].id}" title="${esc(hs.map((h) => h.name).join(" + "))}">${d}</button>`
+        : `<span class="${cls}">${d}</span>`
+    );
+  }
+  const title = first.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
+  return `
+    <div class="card">
+      <div class="spread">
+        <button class="small" data-action="cal-month" data-d="-1" aria-label="Mois précédent">‹</button>
+        <strong style="text-transform:capitalize">${title}</strong>
+        <button class="small" data-action="cal-month" data-d="1" aria-label="Mois suivant">›</button>
+      </div>
+      <p class="muted" style="text-align:center">${monthCount} séance${monthCount > 1 ? "s" : ""} ce mois-ci</p>
+      <div class="cal">
+        ${["L", "M", "M", "J", "V", "S", "D"].map((d) => `<span class="cal-head">${d}</span>`).join("")}
+        ${cells.join("")}
+      </div>
+    </div>`;
+}
+
+// Radar of effective sets per muscle group. One series; the 10-16 target is a shaded ring.
+let radarDays = 7;
+const RADAR_LABEL = { "Ischios-fessiers": "Ischios/fess." }; // short labels so side axes fit at 340 px
+
+function radarChart() {
+  const today = localDay(new Date());
+  const v = weeklyVolume(today, radarDays);
+  const weeks = radarDays === 7 ? 1 : v.weeks;
+  const vals = MUSCLE_GROUPS.map((g) => v.vol[g] / weeks);
+  const W = 340, H = 320, cx = W / 2, cy = 162, R = 100;
+  const max = Math.max(20, ...vals);
+  const pt = (i, val) => {
+    const a = -Math.PI / 2 + (i * 2 * Math.PI) / MUSCLE_GROUPS.length;
+    const r = (val / max) * R;
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  };
+  const ring = (val) => MUSCLE_GROUPS.map((_, i) => pt(i, val).join(",")).join(" ");
+  const poly = (val) => `M${MUSCLE_GROUPS.map((_, i) => pt(i, val).join(",")).join("L")}Z`;
+  const fmt = (x) => (Math.round(x * 10) / 10).toString().replace(".", ",");
+  const labels = MUSCLE_GROUPS.map((g, i) => {
+    const [x, y] = pt(i, max * 1.2);
+    const anchor = Math.abs(x - cx) < 4 ? "middle" : x > cx ? "start" : "end";
+    const status = vals[i] < 10 ? "low" : vals[i] > 16 ? "high" : "ok";
+    return `<text class="radar-label" x="${x}" y="${y}" text-anchor="${anchor}">
+        <tspan x="${x}" dy="-0.2em">${RADAR_LABEL[g] || g}</tspan><tspan class="radar-val ${status}" x="${x}" dy="1.25em">${fmt(vals[i])}${status === "low" ? " ↓" : status === "high" ? " ↑" : ""}</tspan></text>`;
+  }).join("");
+  return `
+    <div class="card">
+      <div class="spread">
+        <h2>Volume par muscle</h2>
+        <span class="seg">
+          <button class="small ${radarDays === 7 ? "on" : ""}" data-action="radar-days" data-days="7">7 jours</button>
+          <button class="small ${radarDays === 28 ? "on" : ""}" data-action="radar-days" data-days="28">Moy. 4 sem.</button>
+        </span>
+      </div>
+      <p class="muted">Séries effectives${radarDays === 7 ? "" : " par semaine"} (échauffements exclus, muscle secondaire = ½). Zone claire = cible 10 à 16 · ↓ sous la cible · ↑ au-dessus.</p>
+      <svg class="radar" viewBox="0 0 ${W} ${H}" role="img" aria-label="Séries par groupe musculaire : ${MUSCLE_GROUPS.map((g, i) => `${g} ${fmt(vals[i])}`).join(", ")}">
+        ${[5, 10, 15, 20].filter((r) => r <= max).map((r) => `<polygon class="radar-grid" points="${ring(r)}"/>`).join("")}
+        ${MUSCLE_GROUPS.map((_, i) => `<line class="radar-grid" x1="${cx}" y1="${cy}" x2="${pt(i, max)[0]}" y2="${pt(i, max)[1]}"/>`).join("")}
+        <path class="radar-target" d="${poly(16)} ${poly(10)}" fill-rule="evenodd"/>
+        <polygon class="radar-area" points="${MUSCLE_GROUPS.map((_, i) => pt(i, vals[i]).join(",")).join(" ")}"/>
+        ${vals.map((val, i) => `<circle class="radar-dot" cx="${pt(i, val)[0]}" cy="${pt(i, val)[1]}" r="4"><title>${MUSCLE_GROUPS[i]} : ${fmt(val)}</title></circle>`).join("")}
+        ${labels}
+      </svg>
+      ${v.unknown.length ? `<p class="muted">Non classés : ${esc(v.unknown.join(", "))}</p>` : ""}
+    </div>`;
+}
+
 function viewHistory() {
   const items = [...state.history].reverse();
   return `
     <div class="eyebrow">${state.history.length} séances</div>
     <h1 class="lead">Historique</h1>
+    ${state.history.length ? radarChart() : ""}
+    <button class="primary block" style="margin:0 0 14px" data-action="go" data-view="report" data-id="weekly">Bilan de la semaine pour le coach</button>
+    <div class="spread" style="margin-bottom:10px">
+      <h2 style="margin:0">Séances</h2>
+      <span class="seg">
+        <button class="small ${historyMode === "list" ? "on" : ""}" data-action="hist-mode" data-mode="list">Liste</button>
+        <button class="small ${historyMode === "calendar" ? "on" : ""}" data-action="hist-mode" data-mode="calendar">Calendrier</button>
+      </span>
+    </div>
+    ${historyMode === "calendar" ? calendarView() : ""}
     ${
-      items.length
+      historyMode === "calendar" ? "" : items.length
         ? items
             .map(
               (h) => `
@@ -1440,7 +1831,7 @@ function viewSession(id) {
     <h1>${esc(h.name)}</h1>
     <p class="muted">${fmtDate(h.startedAt)} · ${h.durationMin} min</p>
     ${h.exercises
-      .map((e) => `<div class="card"><h2>${esc(e.name)}</h2>${e.sets.map((s, i) => `<p>${i + 1}. ${fmtSet(s, e.timed)}</p>`).join("")}</div>`)
+      .map((e) => `<div class="card"><h2>${esc(e.name)}</h2>${e.sets.map((s, i) => `<p>${i + 1}. ${fmtSet(s, e.timed)}</p>`).join("")}${e.comment ? `<p class="note">${esc(e.comment)}</p>` : ""}</div>`)
       .join("")}
     <div class="card">
       <p>Énergie : ${esc(f.energy || "—")}/5 · RPE séance : ${esc(f.sessionRpe || "—")}/10</p>
@@ -1515,6 +1906,7 @@ function render() {
     finish: viewFinish,
     report: () => viewReport(viewArg),
     import: viewImport,
+    importCheck: viewImportCheck,
     history: viewHistory,
     session: () => viewSession(viewArg),
     settings: viewSettings,
@@ -1611,15 +2003,13 @@ document.addEventListener("click", async (ev) => {
     case "rest-stop":
       return stopRest();
     case "copy-report": {
-      const session = state.history.find((h) => h.id === t.dataset.id);
-      const ok = await copy(buildReport(session));
+      const ok = await copy(reportText(t.dataset.id));
       t.textContent = ok ? "Copié ✓" : "Échec : sélectionne le texte à la main";
       return;
     }
     case "share-report": {
       // Call share() before any await: Android drops the user gesture otherwise.
-      const session = state.history.find((h) => h.id === t.dataset.id);
-      navigator.share({ text: buildReport(session) }).catch((err) => {
+      navigator.share({ text: reportText(t.dataset.id) }).catch((err) => {
         if (err.name !== "AbortError") t.textContent = "Partage impossible : utilise Copier";
       });
       return;
@@ -1658,6 +2048,28 @@ document.addEventListener("click", async (ev) => {
       return showRpeHelp();
     case "rpe-close":
       return $("#rpe-dialog").close();
+    case "suspect":
+      pendingImport.suspects[Number(t.dataset.i)].use = t.dataset.use === "1";
+      return render();
+    case "import-confirm":
+      return applyImport(pendingImport);
+    case "import-cancel":
+      pendingImport = null;
+      return go("import");
+    case "hist-mode":
+      historyMode = t.dataset.mode;
+      try {
+        localStorage.setItem("nogro.historyMode", historyMode);
+      } catch {
+        /* per-device preference only */
+      }
+      return render();
+    case "cal-month":
+      calMonth = addMonths(calMonth, Number(t.dataset.d));
+      return render();
+    case "radar-days":
+      radarDays = Number(t.dataset.days);
+      return render();
     case "ex-info":
       return go("exercise", { name: t.dataset.name, back: view, search: false, scroll: window.scrollY });
     case "ex-search":
@@ -1703,6 +2115,7 @@ document.addEventListener("input", (ev) => {
   const field = t.dataset.field;
   if (!field || !state.active) return;
   if (field === "name") state.active.name = t.value;
+  else if (field === "comment") state.active.exercises[Number(t.dataset.ex)].comment = t.value;
   else if (field === "restS") state.active.exercises[Number(t.dataset.ex)].restS = num(t.value);
   else state.active.exercises[Number(t.dataset.ex)].sets[Number(t.dataset.set)][field] = num(t.value);
   save();
@@ -1746,10 +2159,10 @@ document.addEventListener("submit", (ev) => {
           return go("home");
         }
         const { plan, memory } = parsePlan(obj);
-        state.plan = plan;
-        if (memory) state.coachMemory = memory;
-        save();
-        go("home");
+        const suspects = checkPlanNames(plan);
+        if (!suspects.length) return applyImport({ plan, memory });
+        pendingImport = { plan, memory, suspects };
+        go("importCheck");
       } catch (err) {
         $("#import-error").textContent = err.message;
       }
