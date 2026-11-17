@@ -708,6 +708,9 @@ const COACH_GUIDE = `
 - Tu n'as pas d'autre mémoire que ce message. "Mémoire long terme" est ta mémoire : renvoie-la EN ENTIER dans
   "memory", mise à jour (cycle et semaine en cours, blessures, ce qui marche ou pas, préférences, décisions).
   Garde les points encore valides, retire les obsolètes, 15 points maximum.
+- Seules les notes de la "Séance du jour" sont des demandes actuelles. Les notes des séances passées sont du contexte :
+  une demande ponctuelle qu'elles contiennent ("demain", "ce week-end", "2 séances d'affilée") est expirée, ne la planifie pas.
+  Date du jour : voir l'en-tête. Planifie la prochaine séance à partir de cette date.
   Ne recopie pas les mesures (poids, masse grasse) ni le détail des séances dans "memory" : le compte rendu les envoie déjà.
 - "Volume" = séries effectives par muscle, calculées par l'app (échauffements exclus, muscle secondaire = 0,5).
   Sers-t'en pour viser 10 à 16 séries par muscle sur 7 jours et combler les muscles en retard. Mollets : pas de cible.
@@ -852,6 +855,7 @@ function buildReport(session) {
   const records = sessionRecords(idx);
 
   const body = `Tu es mon coach de musculation. Analyse ma séance du jour et mon historique, puis planifie ma prochaine séance.
+Date du jour : ${localDay(new Date())}.
 ${COACH_GUIDE}
 ## Format de réponse
 1. Une analyse courte (5 lignes maximum) : ce qui a progressé, ce qui coince, la décision pour la suite.
@@ -914,6 +918,7 @@ function buildWeeklyReview(endDay = localDay(new Date())) {
 
   const body = `Tu es mon coach de musculation. Fais le BILAN DE MA SEMAINE, ajuste le cycle, le volume et la nutrition,
 puis planifie ma prochaine séance en tenant compte de ce bilan.
+Date du jour : ${localDay(new Date())}.
 ${COACH_GUIDE}
 ## Format de réponse
 1. Bilan (10 lignes maximum) : progression, volume par muscle vs cible, tendance du poids vs objectif, énergie.
